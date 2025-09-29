@@ -98,7 +98,7 @@ logger.info(f"Loaded {len(OPENROUTER_API_KEYS)} API keys for rotation.")
 app = FastAPI(
     title="Mothr API",
     description="An Mothr API-Endpoint",
-    version="2.0.0" # Reverted from 2.1.0
+    version="3.0.0" # Final clean architecture
 )
 
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
@@ -395,31 +395,54 @@ async def chat_completions(request: Request):
     if chat_request.max_tokens:
         generation_config["max_tokens"] = chat_request.max_tokens
 
-    # --- Simple, Reverted Logic ---
+    # This is the simple, reverted logic that respects the client's stream flag
+    # It is vulnerable to timeouts (non-streaming) and empty stream bugs (streaming)
     if chat_request.stream:
         session_logger.info("Streaming response requested.")
         async def stream_generator():
             try:
-                # Determine which model to use
-                execution_model = OPENROUTER_MODEL_NAME # Default for pro
+                user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "")
+                
+                # Determine which model to use for the workflow
+                execution_model = None
                 if chat_request.model == "ra-1":
-                    user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "")
                     execution_model = await select_execution_model(session_logger, user_question)
                     session_logger.info(f"Executing 'ra-1' dynamic stream with model '{execution_model}'.")
                 elif chat_request.model == "ra-1-pro":
+                    execution_model = OPENROUTER_MODEL_NAME
                     session_logger.info(f"Executing 'ra-1-pro' stream with model '{execution_model}'.")
                 
-                # This workflow is now simplified and may not work for multi-agent setups
-                # It essentially becomes a passthrough stream of the selected model
-                # This re-introduces the OpenRouter empty stream bug for large prompts
-                system_prompt = "".join([msg.content for msg in chat_request.messages if msg.role == "system"])
-                user_messages = [msg for msg in chat_request.messages if msg.role != "system"]
-                
-                stream = call_openrouter_agent_stream(session_logger, f"streaming_{chat_request.model}", next(api_key_rotator), execution_model, system_prompt, user_messages, generation_config)
-                
-                async for chunk in stream:
-                    yield chunk
-                
+                if execution_model:
+                    # Multi-agent workflow for ra-1 and ra-1-pro
+                    agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), execution_model, prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
+                    agent_results = await asyncio.gather(*agent_tasks)
+
+                    successful_responses = {res["agent"]: res["response_text"] for res in agent_results if res["status"] == "success"}
+                    if len(successful_responses) < len(AGENT_PROMPTS):
+                        for res in agent_results:
+                            if res["status"] == "error": successful_responses[res["agent"]] = f"[Agent Error: {res.get('error', 'Unknown')}]"
+
+                    synthesizer_user_prompt = SYNTHESIZER_PROMPT_TEMPLATE.format(
+                        user_question=user_question,
+                        factual_analyst_response=successful_responses.get("factual_analyst", ""),
+                        deep_reasoner_response=successful_responses.get("deep_reasoner", ""),
+                        skeptic_critic_response=successful_responses.get("skeptic_critic", ""),
+                        holistic_thinker_response=successful_responses.get("holistic_thinker", "")
+                    )
+                    synthesizer_messages = [ChatMessage(role="user", content=synthesizer_user_prompt)]
+                    
+                    # Stream the synthesizer's response
+                    stream = call_openrouter_agent_stream(session_logger, "master_synthesizer", next(api_key_rotator), execution_model, "You are a master synthesizer.", synthesizer_messages, generation_config)
+                    async for chunk in stream:
+                        yield chunk
+                else:
+                    # Passthrough streaming for other models
+                    system_prompt = "".join([msg.content for msg in chat_request.messages if msg.role == "system"])
+                    user_messages = [msg for msg in chat_request.messages if msg.role != "system"]
+                    stream = call_openrouter_agent_stream(session_logger, f"streaming_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
+                    async for chunk in stream:
+                        yield chunk
+
                 session_logger.info(f"--- END STREAM SESSION: {session_id} ---")
             except Exception as e:
                 session_logger.error(f"An error occurred during stream generation: {e}", exc_info=True)
@@ -432,9 +455,8 @@ async def chat_completions(request: Request):
         total_prompt_tokens = 0
         total_completion_tokens = 0
 
-        # This non-streaming path is vulnerable to gateway timeouts for long requests
         if chat_request.model in ["ra-1", "ra-1-pro"]:
-            execution_model = OPENROUTER_MODEL_NAME # Default for pro
+            execution_model = OPENROUTER_MODEL_NAME
             if chat_request.model == "ra-1":
                 user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "")
                 execution_model = await select_execution_model(session_logger, user_question)
