@@ -209,16 +209,16 @@ Pertanyaan asli dari klien adalah: "{user_question}"
 Berikut adalah empat laporan intelijen dari para analis Anda:
 
 ---
-DRAFT 1: THE FACTUAL ANALYST
+DRAF 1: THE FACTUAL ANALYST
 {factual_analyst_response}
 ---
-DRAFT 2: THE DEEP REASONER
+DRAF 2: THE DEEP REASONER
 {deep_reasoner_response}
 ---
-DRAFT 3: THE SKEPTIC/CRITIC
+DRAF 3: THE SKEPTIC/CRITIC
 {skeptic_critic_response}
 ---
-DRAFT 4: THE HOLISTIC THINKER
+DRAF 4: THE HOLISTIC THINKER
 {holistic_thinker_response}
 ---
 
@@ -343,13 +343,13 @@ async def select_execution_model(session_logger: logging.Logger, user_question: 
     router_config = {"temperature": 0}
 
     router_result = await call_openrouter_agent(
-        session_logger, 
-        "ai_router", 
-        next(api_key_rotator), 
-        ROUTER_MODEL, 
-        "You are an expert API routing assistant.", 
-        router_messages, 
-        router_config
+        session_logger,
+        "ai_router",
+        next(api_key_rotator),
+        ROUTER_MODEL,
+        system_prompt="You are an expert API routing assistant.",
+        user_messages=router_messages,
+        generation_config=router_config
     )
 
     if router_result["status"] == "success" and router_result["response_text"]:
@@ -414,12 +414,20 @@ async def chat_completions(request: Request):
                     user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "No user question found")
                     agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), OPENROUTER_MODEL_NAME, prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
                     agent_results = await asyncio.gather(*agent_tasks)
-                    # ... (rest of the workflow is the same as the dynamic one, just with OPENROUTER_MODEL_NAME)
+                    
                     successful_responses = {res["agent"]: res["response_text"] for res in agent_results if res["status"] == "success"}
                     if len(successful_responses) < len(AGENT_PROMPTS):
                         for res in agent_results:
                             if res["status"] == "error": successful_responses[res["agent"]] = f"[Agent Error: {res.get('error', 'Unknown')}]"
-                    synthesizer_user_prompt = SYNTHESIZER_PROMPT_TEMPLATE.format(user_question=user_question, **successful_responses)
+                    
+                    # Correctly unpack the successful_responses dictionary for formatting
+                    synthesizer_user_prompt = SYNTHESIZER_PROMPT_TEMPLATE.format(
+                        user_question=user_question,
+                        factual_analyst_response=successful_responses.get("factual_analyst", ""),
+                        deep_reasoner_response=successful_responses.get("deep_reasoner", ""),
+                        skeptic_critic_response=successful_responses.get("skeptic_critic", ""),
+                        holistic_thinker_response=successful_responses.get("holistic_thinker", "")
+                    )
                     synthesizer_messages = [ChatMessage(role="user", content=synthesizer_user_prompt)]
                     return await call_openrouter_agent(session_logger, "master_synthesizer", next(api_key_rotator), OPENROUTER_MODEL_NAME, "You are a master synthesizer.", synthesizer_messages, generation_config)
 
@@ -451,7 +459,7 @@ async def chat_completions(request: Request):
         return StreamingResponse(stream_generator_for_pro(), media_type="text/event-stream")
 
     # B. Dynamic model: Uses the AI router, always streams to prevent timeout.
-    if chat_request.model == "ra-1":
+    elif chat_request.model == "ra-1":
         if not chat_request.stream:
             session_logger.info("Client requested non-streaming for 'ra-1', but a stream is being forcibly returned to prevent gateway timeout.")
         
@@ -465,11 +473,20 @@ async def chat_completions(request: Request):
                 async def main_workflow_task():
                     agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), execution_model, prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
                     agent_results = await asyncio.gather(*agent_tasks)
+                    
                     successful_responses = {res["agent"]: res["response_text"] for res in agent_results if res["status"] == "success"}
                     if len(successful_responses) < len(AGENT_PROMPTS):
                         for res in agent_results:
                             if res["status"] == "error": successful_responses[res["agent"]] = f"[Agent Error: {res.get('error', 'Unknown')}]"
-                    synthesizer_user_prompt = SYNTHESIZER_PROMPT_TEMPLATE.format(user_question=user_question, **successful_responses)
+                    
+                    # Correctly unpack the successful_responses dictionary for formatting
+                    synthesizer_user_prompt = SYNTHESIZER_PROMPT_TEMPLATE.format(
+                        user_question=user_question,
+                        factual_analyst_response=successful_responses.get("factual_analyst", ""),
+                        deep_reasoner_response=successful_responses.get("deep_reasoner", ""),
+                        skeptic_critic_response=successful_responses.get("skeptic_critic", ""),
+                        holistic_thinker_response=successful_responses.get("holistic_thinker", "")
+                    )
                     synthesizer_messages = [ChatMessage(role="user", content=synthesizer_user_prompt)]
                     # The synthesizer for the dynamic model also uses the selected execution_model
                     return await call_openrouter_agent(session_logger, "master_synthesizer", next(api_key_rotator), execution_model, "You are a master synthesizer.", synthesizer_messages, generation_config)
@@ -478,7 +495,6 @@ async def chat_completions(request: Request):
                 ping_task = asyncio.create_task(asyncio.sleep(15))
                 tasks = {main_task, ping_task}
                 
-                # Send an initial ping immediately to establish the connection
                 yield b": ping\n\n"
 
                 while not main_task.done():
@@ -506,7 +522,7 @@ async def chat_completions(request: Request):
         return StreamingResponse(stream_generator_for_dynamic(), media_type="text/event-stream")
 
     # C. Other models: Standard passthrough logic
-    if chat_request.stream:
+    elif chat_request.stream:
         session_logger.info("Streaming response requested for passthrough model.")
         async def stream_generator_passthrough():
             try:
