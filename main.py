@@ -158,7 +158,7 @@ class ModelList(BaseModel):
     object: str = "list"
     data: List[Model]
 
-AVAILABLE_MODELS = [Model(id="ra-1", owned_by="Mothr")]
+AVAILABLE_MODELS = [Model(id="ra-1", owned_by="Mothr"), Model(id="ra-1-pro", owned_by="Mothr")]
 
 async def update_available_models():
     """Fetches the list of models from OpenRouter and adds them to the available models list."""
@@ -348,8 +348,7 @@ async def chat_completions(request: Request):
         generation_config["max_tokens"] = chat_request.max_tokens
 
     # Architectural Override: 'ra-1' model MUST be streamed to prevent gateway timeouts.
-    if chat_request.model == "ra-1":
-        if not chat_request.stream:
+                    if chat_request.model == "ra-1-pro":        if not chat_request.stream:
             session_logger.info("Client requested non-streaming for 'ra-1', but a stream is being forcibly returned to prevent gateway timeout. The client must be able to handle a streaming response.")
         
         async def stream_generator_for_ra1():
