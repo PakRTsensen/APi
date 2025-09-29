@@ -98,7 +98,7 @@ logger.info(f"Loaded {len(OPENROUTER_API_KEYS)} API keys for rotation.")
 app = FastAPI(
     title="Mothr API",
     description="An Mothr API-Endpoint",
-    version="2.1.0" # Version updated for tiering feature
+    version="2.0.0" # Reverted from 2.1.0
 )
 
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
@@ -177,16 +177,12 @@ AVAILABLE_MODELS = [
 ]
 
 async def update_available_models():
-    """Fetches the list of models from OpenRouter and adds them to the available models list."""
+    """Adds models from the palette to the list of available models."""
     global AVAILABLE_MODELS
-    # Add palette models to the list of available models
     palette_models = [Model(id=m.get("model_name"), owned_by="openrouter") for m in ROUTER_MODEL_PALETTE]
-    
-    # Combine and remove duplicates
     combined_models = AVAILABLE_MODELS + palette_models
     AVAILABLE_MODELS = list({model.id: model for model in combined_models}.values())
     logger.info(f"Loaded models from palette. Total models available: {len(AVAILABLE_MODELS)}")
-
 
 @app.on_event("startup")
 async def startup_event():
@@ -399,163 +395,104 @@ async def chat_completions(request: Request):
     if chat_request.max_tokens:
         generation_config["max_tokens"] = chat_request.max_tokens
 
-    # --- Model Routing Logic ---
-
-    # A. Pro model: Always uses the high-tier model, always streams to prevent timeout.
-    if chat_request.model == "ra-1-pro":
-        if not chat_request.stream:
-            session_logger.info("Client requested non-streaming for 'ra-1-pro', but a stream is being forcibly returned to prevent gateway timeout.")
-        
-        async def stream_generator_for_pro():
-            # Uses the invisible ping workflow with the high-tier model
+    # --- Simple, Reverted Logic ---
+    if chat_request.stream:
+        session_logger.info("Streaming response requested.")
+        async def stream_generator():
             try:
-                session_logger.info("Executing 'ra-1-pro' invisible ping stream.")
-                async def main_workflow_task():
-                    user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "No user question found")
-                    agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), OPENROUTER_MODEL_NAME, prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
-                    agent_results = await asyncio.gather(*agent_tasks)
-                    
-                    successful_responses = {res["agent"]: res["response_text"] for res in agent_results if res["status"] == "success"}
-                    if len(successful_responses) < len(AGENT_PROMPTS):
-                        for res in agent_results:
-                            if res["status"] == "error": successful_responses[res["agent"]] = f"[Agent Error: {res.get('error', 'Unknown')}]"
-                    
-                    # Correctly unpack the successful_responses dictionary for formatting
-                    synthesizer_user_prompt = SYNTHESIZER_PROMPT_TEMPLATE.format(
-                        user_question=user_question,
-                        factual_analyst_response=successful_responses.get("factual_analyst", ""),
-                        deep_reasoner_response=successful_responses.get("deep_reasoner", ""),
-                        skeptic_critic_response=successful_responses.get("skeptic_critic", ""),
-                        holistic_thinker_response=successful_responses.get("holistic_thinker", "")
-                    )
-                    synthesizer_messages = [ChatMessage(role="user", content=synthesizer_user_prompt)]
-                    return await call_openrouter_agent(session_logger, "master_synthesizer", next(api_key_rotator), OPENROUTER_MODEL_NAME, "You are a master synthesizer.", synthesizer_messages, generation_config)
-
-                main_task = asyncio.create_task(main_workflow_task())
-                ping_task = asyncio.create_task(asyncio.sleep(15))
-                tasks = {main_task, ping_task}
-                while not main_task.done():
-                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    if ping_task in done:
-                        yield b": keep-alive\n\n"
-                        ping_task = asyncio.create_task(asyncio.sleep(15))
-                        tasks = {main_task, ping_task}
-                    if main_task in done: break
-                if not ping_task.done(): ping_task.cancel()
+                # Determine which model to use
+                execution_model = OPENROUTER_MODEL_NAME # Default for pro
+                if chat_request.model == "ra-1":
+                    user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "")
+                    execution_model = await select_execution_model(session_logger, user_question)
+                    session_logger.info(f"Executing 'ra-1' dynamic stream with model '{execution_model}'.")
+                elif chat_request.model == "ra-1-pro":
+                    session_logger.info(f"Executing 'ra-1-pro' stream with model '{execution_model}'.")
                 
-                synthesizer_result = main_task.result()
-                if synthesizer_result["status"] == "success":
-                    session_logger.info("Synthesizer succeeded. Yielding final response to client.")
-                    final_chunk = ChatCompletionStreamResponse(model=chat_request.model, choices=[StreamChoice(delta=StreamDelta(role="assistant", content=synthesizer_result["response_text"]))])
-                    yield f"data: {final_chunk.model_dump_json()}\n\n".encode('utf-8')
-                else:
-                    error_content = f"\n\n[System: Final synthesis failed. Error: {synthesizer_result['error']}]"
-                    error_chunk = ChatCompletionStreamResponse(model=chat_request.model, choices=[StreamChoice(delta=StreamDelta(content=error_content), finish_reason="error")])
-                    yield f"data: {error_chunk.model_dump_json()}\n\n".encode('utf-8')
-                
-                yield b"data: [DONE]\n\n"
-                session_logger.info(f"--- END STREAM SESSION: {session_id} ---")
-            except Exception as e:
-                session_logger.error(f"An error occurred during stream generation: {e}", exc_info=True)
-        return StreamingResponse(stream_generator_for_pro(), media_type="text/event-stream")
-
-    # B. Dynamic model: Uses the AI router, always streams to prevent timeout.
-    elif chat_request.model == "ra-1":
-        if not chat_request.stream:
-            session_logger.info("Client requested non-streaming for 'ra-1', but a stream is being forcibly returned to prevent gateway timeout.")
-        
-        async def stream_generator_for_dynamic():
-            try:
-                user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "")
-                execution_model = await select_execution_model(session_logger, user_question)
-                
-                session_logger.info(f"Executing 'ra-1' dynamic workflow with model '{execution_model}'.")
-
-                async def main_workflow_task():
-                    agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), execution_model, prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
-                    agent_results = await asyncio.gather(*agent_tasks)
-                    
-                    successful_responses = {res["agent"]: res["response_text"] for res in agent_results if res["status"] == "success"}
-                    if len(successful_responses) < len(AGENT_PROMPTS):
-                        for res in agent_results:
-                            if res["status"] == "error": successful_responses[res["agent"]] = f"[Agent Error: {res.get('error', 'Unknown')}]"
-                    
-                    # Correctly unpack the successful_responses dictionary for formatting
-                    synthesizer_user_prompt = SYNTHESIZER_PROMPT_TEMPLATE.format(
-                        user_question=user_question,
-                        factual_analyst_response=successful_responses.get("factual_analyst", ""),
-                        deep_reasoner_response=successful_responses.get("deep_reasoner", ""),
-                        skeptic_critic_response=successful_responses.get("skeptic_critic", ""),
-                        holistic_thinker_response=successful_responses.get("holistic_thinker", "")
-                    )
-                    synthesizer_messages = [ChatMessage(role="user", content=synthesizer_user_prompt)]
-                    # The synthesizer for the dynamic model also uses the selected execution_model
-                    return await call_openrouter_agent(session_logger, "master_synthesizer", next(api_key_rotator), execution_model, "You are a master synthesizer.", synthesizer_messages, generation_config)
-
-                main_task = asyncio.create_task(main_workflow_task())
-                ping_task = asyncio.create_task(asyncio.sleep(15))
-                tasks = {main_task, ping_task}
-                
-                yield b": ping\n\n"
-
-                while not main_task.done():
-                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    if ping_task in done:
-                        yield b": keep-alive\n\n"
-                        ping_task = asyncio.create_task(asyncio.sleep(15))
-                        tasks = {main_task, ping_task}
-                    if main_task in done: break
-                if not ping_task.done(): ping_task.cancel()
-                
-                synthesizer_result = main_task.result()
-                if synthesizer_result["status"] == "success":
-                    session_logger.info("Synthesizer succeeded. Yielding final response to client.")
-                    final_chunk = ChatCompletionStreamResponse(model=chat_request.model, choices=[StreamChoice(delta=StreamDelta(role="assistant", content=synthesizer_result["response_text"]))])
-                    yield f"data: {final_chunk.model_dump_json()}\n\n".encode('utf-8')
-                else:
-                    error_content = f"\n\n[System: Final synthesis failed. Error: {synthesizer_result['error']}]"
-                    error_chunk = ChatCompletionStreamResponse(model=chat_request.model, choices=[StreamChoice(delta=StreamDelta(content=error_content), finish_reason="error")])
-                    yield f"data: {error_chunk.model_dump_json()}\n\n".encode('utf-8')
-
-                yield b"data: [DONE]\n\n"
-                session_logger.info(f"--- END STREAM SESSION: {session_id} ---")
-            except Exception as e:
-                session_logger.error(f"An error occurred during stream generation: {e}", exc_info=True)
-        return StreamingResponse(stream_generator_for_dynamic(), media_type="text/event-stream")
-
-    # C. Other models: Standard passthrough logic
-    elif chat_request.stream:
-        session_logger.info("Streaming response requested for passthrough model.")
-        async def stream_generator_passthrough():
-            try:
-                agent_name = f"direct_passthrough_{chat_request.model}"
+                # This workflow is now simplified and may not work for multi-agent setups
+                # It essentially becomes a passthrough stream of the selected model
+                # This re-introduces the OpenRouter empty stream bug for large prompts
                 system_prompt = "".join([msg.content for msg in chat_request.messages if msg.role == "system"])
                 user_messages = [msg for msg in chat_request.messages if msg.role != "system"]
-                stream = call_openrouter_agent_stream(session_logger, agent_name, next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
                 
-                stream_has_yielded = False
+                stream = call_openrouter_agent_stream(session_logger, f"streaming_{chat_request.model}", next(api_key_rotator), execution_model, system_prompt, user_messages, generation_config)
+                
                 async for chunk in stream:
-                    stream_has_yielded = True
                     yield chunk
                 
-                if not stream_has_yielded:
-                    session_logger.warning(f"Stream for agent '{agent_name}' completed without yielding any data.")
+                session_logger.info(f"--- END STREAM SESSION: {session_id} ---")
             except Exception as e:
                 session_logger.error(f"An error occurred during stream generation: {e}", exc_info=True)
-        return StreamingResponse(stream_generator_passthrough(), media_type="text/event-stream")
-    else:
-        session_logger.info(f"Executing direct passthrough for model '{chat_request.model}'.")
-        system_prompt = "".join([msg.content for msg in chat_request.messages if msg.role == "system"])
-        user_messages = [msg for msg in chat_request.messages if msg.role != "system"]
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+    
+    else: # Non-streaming logic
+        session_logger.info("Non-streaming response requested.")
         
-        direct_result = await call_openrouter_agent(session_logger, f"direct_passthrough_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
+        final_content = ""
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
 
-        if direct_result["status"] == "error":
-            raise HTTPException(status_code=500, detail=f"Direct model call failed: {direct_result['error']}")
-        
-        final_content = direct_result["response_text"]
-        usage = OpenAIUsage(prompt_tokens=direct_result.get("prompt_tokens", 0), completion_tokens=direct_result.get("completion_tokens", 0), total_tokens=direct_result.get("total_tokens", 0))
-        choice = OpenAIChoice(message=OpenAIResponseMessage(content=final_content))
+        # This non-streaming path is vulnerable to gateway timeouts for long requests
+        if chat_request.model in ["ra-1", "ra-1-pro"]:
+            execution_model = OPENROUTER_MODEL_NAME # Default for pro
+            if chat_request.model == "ra-1":
+                user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "")
+                execution_model = await select_execution_model(session_logger, user_question)
+                session_logger.info(f"Executing 'ra-1' dynamic workflow with model '{execution_model}'.")
+            else:
+                session_logger.info(f"Executing 'ra-1-pro' workflow with model '{execution_model}'.")
+
+            user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "No user question found")
+            agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), execution_model, prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
+            agent_results = await asyncio.gather(*agent_tasks)
+
+            successful_responses = {res["agent"]: res["response_text"] for res in agent_results if res["status"] == "success"}
+            if len(successful_responses) < len(AGENT_PROMPTS):
+                session_logger.warning("One or more agents failed to produce a response.")
+                for res in agent_results:
+                    if res["status"] == "error": successful_responses[res["agent"]] = f"[Error processing this agent: {res.get('error', 'Unknown error')}]"
+
+            if not any(res["status"] == "success" for res in agent_results):
+                raise HTTPException(status_code=500, detail=f"All initial agents failed. Last error: {agent_results[-1].get('error', 'Unknown')}")
+
+            synthesizer_user_prompt = SYNTHESIZER_PROMPT_TEMPLATE.format(
+                user_question=user_question,
+                factual_analyst_response=successful_responses.get("factual_analyst", ""),
+                deep_reasoner_response=successful_responses.get("deep_reasoner", ""),
+                skeptic_critic_response=successful_responses.get("skeptic_critic", ""),
+                holistic_thinker_response=successful_responses.get("holistic_thinker", "")
+            )
+            synthesizer_messages = [ChatMessage(role="user", content=synthesizer_user_prompt)]
+            synthesizer_result = await call_openrouter_agent(session_logger, "master_synthesizer", next(api_key_rotator), execution_model, "You are a master synthesizer.", synthesizer_messages, generation_config)
+
+            if synthesizer_result["status"] == "error":
+                raise HTTPException(status_code=500, detail=f"Master synthesizer failed: {synthesizer_result['error']}")
+
+            final_content = synthesizer_result["response_text"]
+            total_prompt_tokens = sum(res.get("prompt_tokens", 0) for res in agent_results) + synthesizer_result.get("prompt_tokens", 0)
+            total_completion_tokens = sum(res.get("completion_tokens", 0) for res in agent_results) + synthesizer_result.get("completion_tokens", 0)
+
+        else: # Passthrough for other models
+            session_logger.info(f"Executing direct passthrough for model '{chat_request.model}'.")
+            system_prompt = "".join([msg.content for msg in chat_request.messages if msg.role == "system"])
+            user_messages = [msg for msg in chat_request.messages if msg.role != "system"]
+            
+            direct_result = await call_openrouter_agent(session_logger, f"direct_passthrough_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
+
+            if direct_result["status"] == "error":
+                raise HTTPException(status_code=500, detail=f"Direct model call failed: {direct_result['error']}")
+            
+            final_content = direct_result["response_text"]
+            total_prompt_tokens = direct_result.get("prompt_tokens", 0)
+            total_completion_tokens = direct_result.get("completion_tokens", 0)
+
+        session_logger.info("--- Final Response ---")
+        session_logger.debug(f"Final Output:\n{final_content}")
+        session_logger.info(f"--- END SESSION: {session_id} ---")
+
+        response_message = OpenAIResponseMessage(content=final_content)
+        choice = OpenAIChoice(message=response_message, finish_reason="stop")
+        usage = OpenAIUsage(prompt_tokens=total_prompt_tokens, completion_tokens=total_completion_tokens, total_tokens=total_prompt_tokens + total_completion_tokens)
 
         return ChatCompletionResponse(model=chat_request.model, choices=[choice], usage=usage)
 
