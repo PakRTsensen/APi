@@ -445,6 +445,7 @@ async def chat_completions(request: Request):
                 
                 synthesizer_result = main_task.result()
                 if synthesizer_result["status"] == "success":
+                    session_logger.info("Synthesizer succeeded. Yielding final response to client.")
                     final_chunk = ChatCompletionStreamResponse(model=chat_request.model, choices=[StreamChoice(delta=StreamDelta(role="assistant", content=synthesizer_result["response_text"]))])
                     yield f"data: {final_chunk.model_dump_json()}\n\n".encode('utf-8')
                 else:
@@ -508,6 +509,7 @@ async def chat_completions(request: Request):
                 
                 synthesizer_result = main_task.result()
                 if synthesizer_result["status"] == "success":
+                    session_logger.info("Synthesizer succeeded. Yielding final response to client.")
                     final_chunk = ChatCompletionStreamResponse(model=chat_request.model, choices=[StreamChoice(delta=StreamDelta(role="assistant", content=synthesizer_result["response_text"]))])
                     yield f"data: {final_chunk.model_dump_json()}\n\n".encode('utf-8')
                 else:
