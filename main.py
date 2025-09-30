@@ -330,7 +330,7 @@ async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_nam
 async def get_agent_model_config(session_logger: logging.Logger, user_question: str) -> Dict[str, str]:
     """
     Uses a small AI model to select a specific execution model for each agent.
-    Returns a dictionary mapping agent names to model names.
+    Tries up to 3 times, then falls back to a default high-tier configuration.
     """
     session_logger.info("--- Getting per-agent model configuration from AI Router ---")
     
@@ -354,33 +354,43 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
         "\n\nYour JSON Response:"
     )
     
-    client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=next(api_key_rotator))
-    
-    try:
-        session_logger.info(f"Calling AI Router with model {ROUTER_MODEL} to get agent config...")
-        response = await client.chat.completions.create(
-            model=ROUTER_MODEL,
-            messages=[{"role": "user", "content": router_prompt}],
-            temperature=0,
-            response_format={"type": "json_object"} # Request JSON output
-        )
-        
-        response_text = response.choices[0].message.content
-        model_config = json.loads(response_text)
+    max_retries = 3
+    retry_delay = 2
 
-        required_keys = set(agent_descriptions.keys())
-        if set(model_config.keys()) != required_keys:
-            raise ValueError(f"Router response missing or has extra keys. Expected: {required_keys}")
+    for attempt in range(max_retries):
+        try:
+            session_logger.info(f"Attempting to get agent config from AI Router. Attempt {attempt + 1}/{max_retries}")
+            client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=next(api_key_rotator))
+            
+            response = await client.chat.completions.create(
+                model=ROUTER_MODEL,
+                messages=[{"role": "user", "content": router_prompt}],
+                temperature=0,
+                response_format={"type": "json_object"}
+            )
+            
+            response_text = response.choices[0].message.content
+            model_config = json.loads(response_text)
 
-        session_logger.info(f"AI Router selected model config: {model_config}")
-        return model_config
+            required_keys = set(agent_descriptions.keys())
+            if set(model_config.keys()) != required_keys:
+                raise ValueError(f"Router response has incorrect keys. Expected: {required_keys}")
 
-    except Exception as e:
-        session_logger.error(f"AI Router failed to generate a valid model configuration. Error: {e}. Falling back to default.")
-        default_model = OPENROUTER_MODEL_NAME
-        fallback_config = {agent: default_model for agent in agent_descriptions.keys()}
-        session_logger.info(f"Using fallback configuration: {fallback_config}")
-        return fallback_config
+            session_logger.info(f"AI Router succeeded on attempt {attempt + 1}. Selected config: {model_config}")
+            return model_config # Success, exit the function
+
+        except Exception as e:
+            session_logger.warning(f"AI Router failed on attempt {attempt + 1}. Error: {e}.")
+            if attempt < max_retries - 1:
+                session_logger.info(f"Retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+
+    # This part is only reached if the loop completes without a successful return
+    session_logger.error(f"AI Router failed after {max_retries} attempts. Falling back to default configuration.")
+    default_model = OPENROUTER_MODEL_NAME
+    fallback_config = {agent: default_model for agent in agent_descriptions.keys()}
+    session_logger.info(f"Using fallback configuration: {fallback_config}")
+    return fallback_config
 
 # --- 5. API Endpoints ---
 @app.api_route("/v1/models", methods=["GET", "OPTIONS"], response_model=ModelList, dependencies=[Security(get_api_key)])
