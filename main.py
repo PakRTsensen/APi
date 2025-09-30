@@ -329,10 +329,10 @@ async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_nam
 
 async def get_agent_model_config(session_logger: logging.Logger, user_question: str) -> Dict[str, str]:
     """
-    Uses a small AI model to select a specific execution model for each agent.
+    Uses a small AI model to select a specific execution model for each agent based on a detailed scoring rubric.
     Tries up to 3 times, then falls back to a default high-tier configuration.
     """
-    session_logger.info("--- Getting per-agent model configuration from AI Router ---")
+    session_logger.info("--- Getting per-agent model configuration from Advanced AI Router ---")
     
     agent_descriptions = {
         "factual_analyst": "Analyzes data, focuses on objective facts and stats.",
@@ -343,12 +343,26 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
     }
 
     router_prompt = (
-        "You are a hyper-efficient, cost-optimizing API orchestrator. Your task is to assign the best AI model to each of five different agents who will collaborate to answer a user's question. "
-        "Analyze the user's question and assign the most cost-effective model for each agent's specific role. Your response MUST be a valid JSON object and nothing else."
-        "The JSON object must have exactly five keys, one for each agent: 'factual_analyst', 'deep_reasoner', 'skeptic_critic', 'holistic_thinker', 'master_synthesizer'."
-        "For simple or factual questions, assign cheap and fast models to all agents. "
-        "For complex, creative, or philosophical questions, assign powerful models to 'deep_reasoner', 'skeptic_critic', and 'master_synthesizer', but you can still use cheaper models for 'factual_analyst' and 'holistic_thinker' to save costs."
-        f"\n\nUSER QUESTION:\n{user_question}"
+        "You are a hyper-efficient, cost-optimizing API orchestrator. Your task is to analyze a user's query and create a detailed JSON response that includes your reasoning and the final model configuration for a team of 5 AI agents."
+        
+        "## Step 1: Analyze the User's Query\n"
+        "Analyze the user's query based on the following three axes, assigning a score from 0.00 to 1.00 for each:"
+        "1. `length_score`: How long and dense is the query? 0.00 for very short (1-5 words), 1.00 for very long (multiple paragraphs)."
+        "2. `topic_score`: How complex is the topic? 0.00 for simple facts ('capital of France'), 0.50 for standard business/technical questions, 1.00 for deeply abstract, philosophical, or creative topics."
+        "3. `context_score`: How much implicit context is needed? 0.00 for self-contained questions, 1.00 for questions that heavily rely on previous conversation turns (e.g., 'what about the second point?')."
+        
+        "**CRITICAL RULE:** If the query is nonsensical, unclear, or garbage, assign low scores (0.00-0.10) to `topic_score` and `context_score` to avoid wasting powerful models."
+
+        "## Step 2: Calculate Total Merit Score\n"
+        "Calculate a `total_merit_score` by taking a weighted average of the three scores. The formula is: `(length_score * 0.2) + (topic_score * 0.5) + (context_score * 0.3)`. This score must be a float between 0.00 and 1.00."
+
+        "## Step 3: Assign Models\n"
+        "Based on the `total_merit_score`, assign a model to each of the 5 agents. Use cheaper/faster models for low scores (< 0.40) and more powerful/SOTA models for high scores (> 0.75), especially for `deep_reasoner` and `master_synthesizer`."
+        
+        "## Step 4: Format Output\n"
+        "Your response MUST be a single, valid JSON object and nothing else. It must contain two top-level keys: `reasoning` and `model_config`."
+        
+        f"\n\nUSER QUESTION:\n'''{user_question}'''"
         f"\n\nAGENT ROLES:\n{json.dumps(agent_descriptions, indent=2)}"
         f"\n\nAVAILABLE MODELS (PALETTE):\n{json.dumps(ROUTER_MODEL_PALETTE, indent=2)}"
         "\n\nYour JSON Response:"
@@ -370,13 +384,20 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
             )
             
             response_text = response.choices[0].message.content
-            model_config = json.loads(response_text)
+            router_output = json.loads(response_text)
+
+            if "reasoning" not in router_output or "model_config" not in router_output:
+                raise ValueError("Router response missing 'reasoning' or 'model_config' keys.")
+            
+            model_config = router_output["model_config"]
+            reasoning = router_output["reasoning"]
 
             required_keys = set(agent_descriptions.keys())
             if set(model_config.keys()) != required_keys:
-                raise ValueError(f"Router response has incorrect keys. Expected: {required_keys}")
+                raise ValueError(f"Router model_config has incorrect keys. Expected: {required_keys}")
 
-            session_logger.info(f"AI Router succeeded on attempt {attempt + 1}. Selected config: {model_config}")
+            session_logger.info(f"AI Router Reasoning: {reasoning}")
+            session_logger.info(f"AI Router selected model config: {model_config}")
             return model_config # Success, exit the function
 
         except Exception as e:
@@ -389,6 +410,7 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
     session_logger.error(f"AI Router failed after {max_retries} attempts. Falling back to default configuration.")
     default_model = OPENROUTER_MODEL_NAME
     fallback_config = {agent: default_model for agent in agent_descriptions.keys()}
+    fallback_config["master_synthesizer"] = default_model # Ensure synthesizer is included
     session_logger.info(f"Using fallback configuration: {fallback_config}")
     return fallback_config
 
