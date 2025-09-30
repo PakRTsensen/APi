@@ -327,47 +327,60 @@ async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_nam
         yield f"data: {json.dumps(error_payload)}\n\n".encode('utf-8')
         yield b"data: [DONE]\n\n"
 
-async def select_execution_model(session_logger: logging.Logger, user_question: str) -> str:
+async def get_agent_model_config(session_logger: logging.Logger, user_question: str) -> Dict[str, str]:
     """
-    Uses a small AI model to select the most cost-effective execution model from a palette.
+    Uses a small AI model to select a specific execution model for each agent.
+    Returns a dictionary mapping agent names to model names.
     """
-    session_logger.info("--- Selecting execution model with AI Router ---")
+    session_logger.info("--- Getting per-agent model configuration from AI Router ---")
     
+    agent_descriptions = {
+        "factual_analyst": "Analyzes data, focuses on objective facts and stats.",
+        "deep_reasoner": "A first-principles thinker, breaks down problems to their basics, explains the 'why'.",
+        "skeptic_critic": "A relentless intellectual adversary, challenges assumptions, finds weaknesses and risks.",
+        "holistic_thinker": "A systems thinker, connects ideas to broader context (social, economic), thinks long-term.",
+        "master_synthesizer": "The editor-in-chief. Synthesizes the other four reports into a single, coherent executive answer."
+    }
+
     router_prompt = (
-        "You are a hyper-efficient API router. Your task is to select the most cost-effective AI model to answer the user's question. "
-        "You will be given a list of available models in JSON format. Analyze the user's question and return ONLY the `model_name` of the single best model for the job. "
-        "Do not explain your choice. If the question is complex and requires deep reasoning, choose the most powerful model."
-        f"\n\nAvailable Models:\n{json.dumps(ROUTER_MODEL_PALETTE, indent=2)}"
-        f"\n\nUser Question:\n{user_question}"
+        "You are a hyper-efficient, cost-optimizing API orchestrator. Your task is to assign the best AI model to each of five different agents who will collaborate to answer a user's question. "
+        "Analyze the user's question and assign the most cost-effective model for each agent's specific role. Your response MUST be a valid JSON object and nothing else."
+        "The JSON object must have exactly five keys, one for each agent: 'factual_analyst', 'deep_reasoner', 'skeptic_critic', 'holistic_thinker', 'master_synthesizer'."
+        "For simple or factual questions, assign cheap and fast models to all agents. "
+        "For complex, creative, or philosophical questions, assign powerful models to 'deep_reasoner', 'skeptic_critic', and 'master_synthesizer', but you can still use cheaper models for 'factual_analyst' and 'holistic_thinker' to save costs."
+        f"\n\nUSER QUESTION:\n{user_question}"
+        f"\n\nAGENT ROLES:\n{json.dumps(agent_descriptions, indent=2)}"
+        f"\n\nAVAILABLE MODELS (PALETTE):\n{json.dumps(ROUTER_MODEL_PALETTE, indent=2)}"
+        "\n\nYour JSON Response:"
     )
     
-    router_messages = [ChatMessage(role="user", content=router_prompt)]
-    router_config = {"temperature": 0}
+    client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=next(api_key_rotator))
+    
+    try:
+        session_logger.info(f"Calling AI Router with model {ROUTER_MODEL} to get agent config...")
+        response = await client.chat.completions.create(
+            model=ROUTER_MODEL,
+            messages=[{"role": "user", "content": router_prompt}],
+            temperature=0,
+            response_format={"type": "json_object"} # Request JSON output
+        )
+        
+        response_text = response.choices[0].message.content
+        model_config = json.loads(response_text)
 
-    router_result = await call_openrouter_agent(
-        session_logger,
-        "ai_router",
-        next(api_key_rotator),
-        ROUTER_MODEL,
-        system_prompt="You are an expert API routing assistant.",
-        user_messages=router_messages,
-        generation_config=router_config
-    )
+        required_keys = set(agent_descriptions.keys())
+        if set(model_config.keys()) != required_keys:
+            raise ValueError(f"Router response missing or has extra keys. Expected: {required_keys}")
 
-    if router_result["status"] == "success" and router_result["response_text"]:
-        selected_model = router_result["response_text"].strip().strip('"`')
-        available_model_names = [m["model_name"] for m in ROUTER_MODEL_PALETTE]
-        if selected_model in available_model_names:
-            session_logger.info(f"AI Router selected model: '{selected_model}'")
-            return selected_model
-        else:
-            session_logger.warning(f"Router selected an invalid model: '{selected_model}'. Falling back to default.")
-    else:
-        session_logger.error(f"AI Router failed to select a model. Error: {router_result.get('error')}")
+        session_logger.info(f"AI Router selected model config: {model_config}")
+        return model_config
 
-    default_model = OPENROUTER_MODEL_NAME
-    session_logger.info(f"Falling back to default high-tier model: '{default_model}'")
-    return default_model
+    except Exception as e:
+        session_logger.error(f"AI Router failed to generate a valid model configuration. Error: {e}. Falling back to default.")
+        default_model = OPENROUTER_MODEL_NAME
+        fallback_config = {agent: default_model for agent in agent_descriptions.keys()}
+        session_logger.info(f"Using fallback configuration: {fallback_config}")
+        return fallback_config
 
 # --- 5. API Endpoints ---
 @app.api_route("/v1/models", methods=["GET", "OPTIONS"], response_model=ModelList, dependencies=[Security(get_api_key)])
@@ -401,26 +414,23 @@ async def chat_completions(request: Request):
     if chat_request.max_tokens:
         generation_config["max_tokens"] = chat_request.max_tokens
 
-    # This is the simple, reverted logic that respects the client's stream flag
-    # It is vulnerable to timeouts (non-streaming) and empty stream bugs (streaming)
+    user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "")
+
     if chat_request.stream:
         session_logger.info("Streaming response requested.")
         async def stream_generator():
             try:
-                user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "")
-                
-                # Determine which model to use for the workflow
-                execution_model = None
+                model_config = None
                 if chat_request.model == "ra-1":
-                    execution_model = await select_execution_model(session_logger, user_question)
-                    session_logger.info(f"Executing 'ra-1' dynamic stream with model '{execution_model}'.")
+                    model_config = await get_agent_model_config(session_logger, user_question)
                 elif chat_request.model == "ra-1-pro":
-                    execution_model = OPENROUTER_MODEL_NAME
-                    session_logger.info(f"Executing 'ra-1-pro' stream with model '{execution_model}'.")
+                    default_model = OPENROUTER_MODEL_NAME
+                    model_config = {agent: default_model for agent in AGENT_PROMPTS.keys()}
+                    model_config["master_synthesizer"] = default_model
+                    session_logger.info(f"Executing 'ra-1-pro' stream with static config: {model_config}")
                 
-                if execution_model:
-                    # Multi-agent workflow for ra-1 and ra-1-pro
-                    agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), execution_model, prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
+                if model_config:
+                    agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), model_config[name], prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
                     agent_results = await asyncio.gather(*agent_tasks)
 
                     successful_responses = {res["agent"]: res["response_text"] for res in agent_results if res["status"] == "success"}
@@ -437,12 +447,10 @@ async def chat_completions(request: Request):
                     )
                     synthesizer_messages = [ChatMessage(role="user", content=synthesizer_user_prompt)]
                     
-                    # Stream the synthesizer's response
-                    stream = call_openrouter_agent_stream(session_logger, "master_synthesizer", next(api_key_rotator), execution_model, "You are a master synthesizer.", synthesizer_messages, generation_config)
+                    stream = call_openrouter_agent_stream(session_logger, "master_synthesizer", next(api_key_rotator), model_config["master_synthesizer"], "You are a master synthesizer.", synthesizer_messages, generation_config)
                     async for chunk in stream:
                         yield chunk
                 else:
-                    # Passthrough streaming for other models
                     system_prompt = "".join([msg.content for msg in chat_request.messages if msg.role == "system"])
                     user_messages = [msg for msg in chat_request.messages if msg.role != "system"]
                     stream = call_openrouter_agent_stream(session_logger, f"streaming_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
@@ -457,21 +465,17 @@ async def chat_completions(request: Request):
     else: # Non-streaming logic
         session_logger.info("Non-streaming response requested.")
         
-        final_content = ""
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
+        model_config = None
+        if chat_request.model == "ra-1":
+            model_config = await get_agent_model_config(session_logger, user_question)
+        elif chat_request.model == "ra-1-pro":
+            default_model = OPENROUTER_MODEL_NAME
+            model_config = {agent: default_model for agent in AGENT_PROMPTS.keys()}
+            model_config["master_synthesizer"] = default_model
+            session_logger.info(f"Executing 'ra-1-pro' workflow with static config: {model_config}")
 
-        if chat_request.model in ["ra-1", "ra-1-pro"]:
-            execution_model = OPENROUTER_MODEL_NAME
-            if chat_request.model == "ra-1":
-                user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "")
-                execution_model = await select_execution_model(session_logger, user_question)
-                session_logger.info(f"Executing 'ra-1' dynamic workflow with model '{execution_model}'.")
-            else:
-                session_logger.info(f"Executing 'ra-1-pro' workflow with model '{execution_model}'.")
-
-            user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "No user question found")
-            agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), execution_model, prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
+        if model_config:
+            agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), model_config[name], prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
             agent_results = await asyncio.gather(*agent_tasks)
 
             successful_responses = {res["agent"]: res["response_text"] for res in agent_results if res["status"] == "success"}
@@ -491,7 +495,7 @@ async def chat_completions(request: Request):
                 holistic_thinker_response=successful_responses.get("holistic_thinker", "")
             )
             synthesizer_messages = [ChatMessage(role="user", content=synthesizer_user_prompt)]
-            synthesizer_result = await call_openrouter_agent(session_logger, "master_synthesizer", next(api_key_rotator), execution_model, "You are a master synthesizer.", synthesizer_messages, generation_config)
+            synthesizer_result = await call_openrouter_agent(session_logger, "master_synthesizer", next(api_key_rotator), model_config["master_synthesizer"], "You are a master synthesizer.", synthesizer_messages, generation_config)
 
             if synthesizer_result["status"] == "error":
                 raise HTTPException(status_code=500, detail=f"Master synthesizer failed: {synthesizer_result['error']}")
