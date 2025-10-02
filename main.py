@@ -111,6 +111,22 @@ async def get_api_key(api_key_header: str = Security(api_key_header)):
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return token
 
+# Model Aliases
+MODEL_ALIASES_STRING = os.getenv("MODEL_ALIASES")
+
+def get_model_aliases() -> Dict[str, str]:
+    """Parses the MODEL_ALIASES environment variable into a dictionary."""
+    if not MODEL_ALIASES_STRING:
+        return {}
+    
+    aliases = {}
+    pairs = MODEL_ALIASES_STRING.split(',')
+    for pair in pairs:
+        if ':' in pair:
+            original, alias = pair.rsplit(':', 1)
+            aliases[original.strip()] = alias.strip()
+    return aliases
+
 # --- 2. Pydantic Models ---
 class ChatMessage(BaseModel):
     role: str
@@ -176,16 +192,53 @@ AVAILABLE_MODELS = [
     Model(id="ra-1-pro")
 ]
 
+MODEL_ALIASES: Dict[str, str] = {}
+REVERSE_MODEL_ALIASES: Dict[str, str] = {}
+
+def load_aliases_from_env():
+    """Parses aliases from environment and populates global mapping dictionaries."""
+    global MODEL_ALIASES, REVERSE_MODEL_ALIASES
+    if not MODEL_ALIASES_STRING:
+        return
+    
+    aliases = {}
+    reverse_aliases = {}
+    pairs = MODEL_ALIASES_STRING.split(',')
+    for pair in pairs:
+        if ':' in pair:
+            original, alias = pair.rsplit(':', 1)
+            original, alias = original.strip(), alias.strip()
+            aliases[original] = alias
+            reverse_aliases[alias] = original
+    
+    MODEL_ALIASES = aliases
+    REVERSE_MODEL_ALIASES = reverse_aliases
+    logger.info(f"Loaded {len(MODEL_ALIASES)} model aliases.")
+
 async def update_available_models():
-    """Adds models from the palette to the list of available models."""
+    """Adds models from the palette to the list of available models and applies aliases."""
     global AVAILABLE_MODELS
-    palette_models = [Model(id=m.get("model_name"), owned_by="openrouter") for m in ROUTER_MODEL_PALETTE]
+    
+    palette_models = []
+    for m in ROUTER_MODEL_PALETTE:
+        model_id = m.get("model_name")
+        if model_id:
+            # Apply alias if it exists for display purposes
+            display_id = MODEL_ALIASES.get(model_id, model_id)
+            palette_models.append(Model(id=display_id, owned_by="openrouter"))
+
+    # Combine base models with aliased palette models
     combined_models = AVAILABLE_MODELS + palette_models
-    AVAILABLE_MODELS = list({model.id: model for model in combined_models}.values())
-    logger.info(f"Loaded models from palette. Total models available: {len(AVAILABLE_MODELS)}")
+    
+    # Use a dictionary to handle potential duplicates
+    model_dict = {model.id: model for model in combined_models}
+    AVAILABLE_MODELS = list(model_dict.values())
+    
+    logger.info(f"Loaded and aliased models from palette. Total models available: {len(AVAILABLE_MODELS)}")
 
 @app.on_event("startup")
 async def startup_event():
+    load_aliases_from_env()
     await update_available_models()
 
 # --- 3. Agent Prompts ---
@@ -435,12 +488,27 @@ async def chat_completions(request: Request):
         session_logger.error(f"Pydantic validation failed: {e}")
         raise HTTPException(status_code=422, detail=f"Invalid request body: {e}")
 
-    session_logger.info(f"Received model: '{chat_request.model}', Stream: {chat_request.stream}")
+    # --- [CORRECTED] Model Validation and Alias Mapping --- 
+    requested_model = chat_request.model
+    session_logger.info(f"Received model request for: '{requested_model}', Stream: {chat_request.stream}")
 
-    available_model_ids = [m.id for m in AVAILABLE_MODELS]
-    if chat_request.model not in available_model_ids:
-        session_logger.warning(f"Invalid model requested: '{chat_request.model}'")
-        raise HTTPException(status_code=404, detail=f"Model not found: '{chat_request.model}'")
+    # 1. Determine the original model ID to validate.
+    # If the request is an alias, get the original name. Otherwise, use the name as is.
+    model_to_validate_and_call = REVERSE_MODEL_ALIASES.get(requested_model, requested_model)
+    if requested_model in REVERSE_MODEL_ALIASES:
+        session_logger.info(f"Alias '{requested_model}' detected. Validating original model '{model_to_validate_and_call}'.")
+
+    # 2. Validate against the ground truth: the ROUTER_MODEL_PALETTE from .env
+    # Also allow the special 'ra-1' and 'ra-1-pro' models.
+    valid_original_models = [m["model_name"] for m in ROUTER_MODEL_PALETTE] + ["ra-1", "ra-1-pro"]
+    if model_to_validate_and_call not in valid_original_models:
+        session_logger.warning(f"Validation failed. Model '{model_to_validate_and_call}' is not in the configured ROUTER_MODEL_PALETTE.")
+        raise HTTPException(status_code=404, detail=f"Model not found: {requested_model}")
+
+    # 3. Set the request model to the original ID for the API call.
+    chat_request.model = model_to_validate_and_call
+    # ---
+
 
     generation_config = {"temperature": chat_request.temperature}
     if chat_request.max_tokens:
