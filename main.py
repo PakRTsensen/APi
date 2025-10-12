@@ -25,17 +25,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RA-1")
 
-def setup_session_logger(session_id: str) -> logging.Logger:
-    """Creates and configures a logger for a specific session that logs to both file and console."""
+def setup_session_logger(session_id: str, proxy_key: str) -> logging.Logger:
+    """Creates and configures a logger for a specific session that logs to both file and console, in a folder specific to the proxy_key."""
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     log_filename = f"{timestamp}_{session_id}.log"
-    log_filepath = os.path.join(LOGS_DIR, log_filename)
+    
+    # Create a subdirectory for the proxy_key
+    proxy_key_log_dir = os.path.join(LOGS_DIR, proxy_key)
+    os.makedirs(proxy_key_log_dir, exist_ok=True)
+
+    log_filepath = os.path.join(proxy_key_log_dir, log_filename)
 
     session_logger = logging.getLogger(session_id)
     session_logger.setLevel(logging.DEBUG)
 
     if session_logger.handlers:
-        return session_logger
+        # Remove existing handlers to prevent duplicate logs if logger is reused
+        for handler in list(session_logger.handlers):
+            session_logger.removeHandler(handler)
 
     file_handler = logging.FileHandler(log_filepath)
     file_handler.setLevel(logging.DEBUG)
@@ -56,16 +63,30 @@ def setup_session_logger(session_id: str) -> logging.Logger:
 load_dotenv()
 
 # Core Keys
+PROXY_AUTH_KEY_STRING = os.getenv("PROXY_AUTH_KEY")
 OPENROUTER_API_KEY_STRING = os.getenv("OPENROUTER_API_KEY")
-PROXY_AUTH_KEY = os.getenv("PROXY_AUTH_KEY")
+
+if not PROXY_AUTH_KEY_STRING or not OPENROUTER_API_KEY_STRING:
+    raise ValueError("PROXY_AUTH_KEY and OPENROUTER_API_KEY must be set in the .env file.")
+
+# Parse multiple proxy keys
+VALID_PROXY_KEYS = {key.strip() for key in PROXY_AUTH_KEY_STRING.split(',') if key.strip()}
+if not VALID_PROXY_KEYS:
+    raise ValueError("No valid PROXY_AUTH_KEYs found after parsing.")
+
+# Parse multiple OpenRouter API keys
+OPENROUTER_API_KEYS_LIST = [key.strip() for key in OPENROUTER_API_KEY_STRING.split(',') if key.strip()]
+if not OPENROUTER_API_KEYS_LIST:
+    raise ValueError("No valid OpenRouter API keys found after parsing.")
+
+api_key_rotator = itertools.cycle(OPENROUTER_API_KEYS_LIST)
+logger.info(f"Loaded {len(OPENROUTER_API_KEYS_LIST)} OpenRouter API keys for rotation.")
+logger.info(f"Loaded {len(VALID_PROXY_KEYS)} valid proxy keys.")
 
 # Model Tiering Configuration
 OPENROUTER_MODEL_NAME = os.getenv("OPENROUTER_MODEL_NAME", "google/gemini-2.5-pro")
 ROUTER_MODEL = os.getenv("ROUTER_MODEL", "x-ai/grok-4-fast:free")
 ROUTER_MODEL_PALETTE_STRING = os.getenv("ROUTER_MODEL_PALETTE")
-
-if not OPENROUTER_API_KEY_STRING or not PROXY_AUTH_KEY:
-    raise ValueError("OPENROUTER_API_KEY and PROXY_AUTH_KEY must be set in .env file")
 
 if not ROUTER_MODEL_PALETTE_STRING:
     raise ValueError("ROUTER_MODEL_PALETTE must be set in .env file for the dynamic 'ra-1' model to work.")
@@ -75,26 +96,6 @@ try:
 except json.JSONDecodeError:
     raise ValueError("ROUTER_MODEL_PALETTE in .env file is not a valid JSON string.")
 
-# Robustly parse the OPENROUTER_API_KEY
-keys = []
-if OPENROUTER_API_KEY_STRING.strip().startswith('['):
-    try:
-        keys = json.loads(OPENROUTER_API_KEY_STRING)
-        if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
-            logger.error("OPENROUTER_API_KEY is a malformed JSON array. It must be an array of strings.")
-            keys = []
-    except json.JSONDecodeError:
-        logger.error("Failed to parse OPENROUTER_API_KEY as a JSON array.")
-else:
-    keys = [key.strip() for key in OPENROUTER_API_KEY_STRING.split(',')]
-
-OPENROUTER_API_KEYS = [key.strip('"\'') for key in keys if key]
-if not OPENROUTER_API_KEYS:
-    raise ValueError("No valid OpenRouter API keys found after parsing.")
-
-api_key_rotator = itertools.cycle(OPENROUTER_API_KEYS)
-logger.info(f"Loaded {len(OPENROUTER_API_KEYS)} API keys for rotation.")
-
 app = FastAPI(
     title="Mothr API",
     description="An Mothr API-Endpoint",
@@ -103,12 +104,16 @@ app = FastAPI(
 
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
-async def get_api_key(api_key_header: str = Security(api_key_header)):
+async def get_api_key(api_key_header: str = Security(api_key_header)) -> str:
+    """Validates the proxy key and returns the authenticated key for logging."""
     if not api_key_header or not api_key_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid Authorization header format")
+    
     token = api_key_header.split(" ")[1]
-    if token != PROXY_AUTH_KEY:
+    
+    if token not in VALID_PROXY_KEYS:
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    
     return token
 
 # Model Aliases
@@ -474,12 +479,12 @@ async def list_models():
     return ModelList(data=AVAILABLE_MODELS)
 
 @app.post("/v1/chat/completions", dependencies=[Security(get_api_key)])
-async def chat_completions(request: Request):
+async def chat_completions(request: Request, authenticated_proxy_key: str = Security(get_api_key)):
     session_id = str(uuid.uuid4())
-    session_logger = setup_session_logger(session_id)
+    session_logger = setup_session_logger(session_id, authenticated_proxy_key)
     
     body = await request.json()
-    session_logger.info(f"--- START SESSION: {session_id} ---")
+    session_logger.info(f"--- START SESSION: {session_id} (Proxy Key: {authenticated_proxy_key}) ---")
     session_logger.debug(f"Full Request Body:\n{json.dumps(body, indent=2)}")
 
     try:
@@ -508,7 +513,6 @@ async def chat_completions(request: Request):
     # 3. Set the request model to the original ID for the API call.
     chat_request.model = model_to_validate_and_call
     # ---
-
 
     generation_config = {"temperature": chat_request.temperature}
     if chat_request.max_tokens:
@@ -582,7 +586,7 @@ async def chat_completions(request: Request):
             if len(successful_responses) < len(AGENT_PROMPTS):
                 session_logger.warning("One or more agents failed to produce a response.")
                 for res in agent_results:
-                    if res["status"] == "error": successful_responses[res["agent"]] = f"[Error processing this agent: {res.get('error', 'Unknown error')}]"
+                            if res["status"] == "error": successful_responses[res["agent"]] = f"[Agent Error: {res.get('error', 'Unknown')}]"
 
             if not any(res["status"] == "success" for res in agent_results):
                 raise HTTPException(status_code=500, detail=f"All initial agents failed. Last error: {agent_results[-1].get('error', 'Unknown')}")
