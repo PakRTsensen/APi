@@ -99,7 +99,7 @@ except json.JSONDecodeError:
 app = FastAPI(
     title="Mothr API",
     description="An Mothr API-Endpoint",
-    version="3.0.0" # architecture version, but rest API version 1 Compatible
+    version="3.1.0" # architecture version, but rest API version 1 Compatible
 )
 
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
@@ -133,9 +133,20 @@ def get_model_aliases() -> Dict[str, str]:
     return aliases
 
 # --- 2. Pydantic Models ---
+class TextContentPart(BaseModel):
+    type: str = "text"
+    text: str
+
+class ImageUrl(BaseModel):
+    url: str
+
+class ImageContentPart(BaseModel):
+    type: str = "image_url"
+    image_url: ImageUrl
+
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | List[TextContentPart | ImageContentPart]
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -310,7 +321,7 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
     client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
     
     messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
-    messages.extend([{"role": msg.role, "content": msg.content} for msg in user_messages])
+    messages.extend([msg.model_dump() for msg in user_messages])
     
     payload = {"model": model_name, "messages": messages, **generation_config}
     session_logger.debug(f"Agent '{agent_name}' Request Payload:\n{json.dumps(payload, indent=2)}")
@@ -365,7 +376,7 @@ async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_nam
     client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
     
     messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
-    messages.extend([{"role": msg.role, "content": msg.content} for msg in user_messages])
+    messages.extend([msg.model_dump() for msg in user_messages])
 
     payload = {"model": model_name, "messages": messages, "stream": True, **generation_config}
     session_logger.debug(f"Agent '{agent_name}' Stream Request Payload:\n{json.dumps(payload, indent=2)}")
@@ -518,7 +529,19 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
     if chat_request.max_tokens:
         generation_config["max_tokens"] = chat_request.max_tokens
 
-    user_question = next((msg.content for msg in reversed(chat_request.messages) if msg.role == 'user'), "")
+    user_question = ""
+    for msg in reversed(chat_request.messages):
+        if msg.role == 'user':
+            if isinstance(msg.content, str):
+                user_question = msg.content
+                break
+            elif isinstance(msg.content, list):
+                for part in msg.content:
+                    if hasattr(part, 'text'):
+                        user_question = part.text
+                        break
+            if user_question:
+                break
 
     if chat_request.stream:
         session_logger.info("Streaming response requested.")
@@ -555,8 +578,19 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                     async for chunk in stream:
                         yield chunk
                 else:
-                    system_prompt = "".join([msg.content for msg in chat_request.messages if msg.role == "system"])
-                    user_messages = [msg for msg in chat_request.messages if msg.role != "system"]
+                    system_prompt_parts = []
+                    user_messages = []
+                    for msg in chat_request.messages:
+                        if msg.role == "system":
+                            if isinstance(msg.content, str):
+                                system_prompt_parts.append(msg.content)
+                            elif isinstance(msg.content, list):
+                                for part in msg.content:
+                                    if hasattr(part, 'text'):
+                                        system_prompt_parts.append(part.text)
+                        else:
+                            user_messages.append(msg)
+                    system_prompt = "".join(system_prompt_parts)
                     stream = call_openrouter_agent_stream(session_logger, f"streaming_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
                     async for chunk in stream:
                         yield chunk
@@ -610,8 +644,19 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
 
         else: # Passthrough for other models
             session_logger.info(f"Executing direct passthrough for model '{chat_request.model}'.")
-            system_prompt = "".join([msg.content for msg in chat_request.messages if msg.role == "system"])
-            user_messages = [msg for msg in chat_request.messages if msg.role != "system"]
+            system_prompt_parts = []
+            user_messages = []
+            for msg in chat_request.messages:
+                if msg.role == "system":
+                    if isinstance(msg.content, str):
+                        system_prompt_parts.append(msg.content)
+                    elif isinstance(msg.content, list):
+                        for part in msg.content:
+                            if hasattr(part, 'text'):
+                                system_prompt_parts.append(part.text)
+                else:
+                    user_messages.append(msg)
+            system_prompt = "".join(system_prompt_parts)
             
             direct_result = await call_openrouter_agent(session_logger, f"direct_passthrough_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
 
