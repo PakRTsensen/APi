@@ -65,43 +65,68 @@ def setup_session_logger(session_id: str, proxy_key: str) -> logging.Logger:
 # --- 1. Configuration & Initialization ---
 load_dotenv()
 
-# Global variable for rate limiting, to be set at startup
+# Global variables for configuration, will be set from environment variables.
 RATE_LIMIT_PER_MINUTE = 0 
-
-# Core Keys
-PROXY_AUTH_KEY_STRING = os.getenv("PROXY_AUTH_KEY")
-OPENROUTER_API_KEY_STRING = os.getenv("OPENROUTER_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
-
-if not PROXY_AUTH_KEY_STRING or not OPENROUTER_API_KEY_STRING or not OPENAI_BASE_URL:
-    raise ValueError("PROXY_AUTH_KEY, OPENROUTER_API_KEY, and OPENAI_BASE_URL must be set in the .env file.")
-
-# Parse multiple proxy keys
-VALID_PROXY_KEYS = {key.strip() for key in PROXY_AUTH_KEY_STRING.split(',') if key.strip()}
-if not VALID_PROXY_KEYS:
-    raise ValueError("No valid PROXY_AUTH_KEYs found after parsing.")
-
-# Parse multiple OpenRouter API keys
-OPENROUTER_API_KEYS_LIST = [key.strip() for key in OPENROUTER_API_KEY_STRING.split(',') if key.strip()]
-if not OPENROUTER_API_KEYS_LIST:
-    raise ValueError("No valid OpenRouter API keys found after parsing.")
-
-api_key_rotator = itertools.cycle(OPENROUTER_API_KEYS_LIST)
-logger.info(f"Loaded {len(OPENROUTER_API_KEYS_LIST)} OpenRouter API keys for rotation.")
-logger.info(f"Loaded {len(VALID_PROXY_KEYS)} valid proxy keys.")
-
-# Model Tiering Configuration
-OPENROUTER_MODEL_NAME = os.getenv("OPENROUTER_MODEL_NAME", "google/gemini-2.5-pro")
-ROUTER_MODEL = os.getenv("ROUTER_MODEL", "x-ai/grok-4-fast:free")
-ROUTER_MODEL_PALETTE_STRING = os.getenv("ROUTER_MODEL_PALETTE")
-
-if not ROUTER_MODEL_PALETTE_STRING:
-    raise ValueError("ROUTER_MODEL_PALETTE must be set in .env file for the dynamic 'ra-1' model to work.")
+MAX_RETRIES = 3
+RETRY_DELAY = 10
+VALID_PROXY_KEYS = set()
+OPENAI_API_KEYS_LIST = []
+openai_api_key_rotator = None
+OPENAI_DEFAULT_MODEL_NAME = "google/gemini-2.5-pro"
+ROUTING_MODEL = "x-ai/grok-4-fast:free"
+MODEL_PALETTE = []
 
 try:
-    ROUTER_MODEL_PALETTE = json.loads(ROUTER_MODEL_PALETTE_STRING)
-except json.JSONDecodeError:
-    raise ValueError("ROUTER_MODEL_PALETTE in .env file is not a valid JSON string.")
+    # --- Environment Variable Loading ---
+    missing_keys = []
+    env_vars = {
+        "PROXY_AUTH_KEY": os.getenv("PROXY_AUTH_KEY"),
+        "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+        "OPENAI_BASE_URL": os.getenv("OPENAI_BASE_URL"),
+        "MODEL_PALETTE": os.getenv("MODEL_PALETTE")
+    }
+    
+    for key, value in env_vars.items():
+        if not value:
+            missing_keys.append(key)
+    
+    if missing_keys:
+        raise ValueError(f"Required environment variables are not set: {', '.join(missing_keys)}")
+
+    # --- Configuration Parsing ---
+    PROXY_AUTH_KEY_STRING = env_vars["PROXY_AUTH_KEY"]
+    OPENAI_API_KEY_STRING = env_vars["OPENAI_API_KEY"]
+    OPENAI_BASE_URL = env_vars["OPENAI_BASE_URL"]
+    MODEL_PALETTE_STRING = env_vars["MODEL_PALETTE"]
+
+    # Parse multiple proxy keys
+    VALID_PROXY_KEYS = {key.strip() for key in PROXY_AUTH_KEY_STRING.split(',') if key.strip()}
+    if not VALID_PROXY_KEYS:
+        raise ValueError("No valid PROXY_AUTH_KEYs found. Is PROXY_AUTH_KEY set correctly?")
+
+    # Parse multiple OpenAI API keys
+    OPENAI_API_KEYS_LIST = [key.strip() for key in OPENAI_API_KEY_STRING.split(',') if key.strip()]
+    if not OPENAI_API_KEYS_LIST:
+        raise ValueError("No valid OpenAI API keys found. Is OPENAI_API_KEY set correctly?")
+
+    openai_api_key_rotator = itertools.cycle(OPENAI_API_KEYS_LIST)
+    logger.info(f"Loaded {len(OPENAI_API_KEYS_LIST)} OpenAI API keys for rotation.")
+    logger.info(f"Loaded {len(VALID_PROXY_KEYS)} valid proxy keys.")
+
+    # Model Tiering Configuration, loaded from env but with defaults
+    OPENAI_DEFAULT_MODEL_NAME = os.getenv("OPENAI_DEFAULT_MODEL_NAME", "google/gemini-2.5-pro")
+    ROUTING_MODEL = os.getenv("ROUTING_MODEL", "x-ai/grok-4-fast:free")
+
+    try:
+        MODEL_PALETTE = json.loads(MODEL_PALETTE_STRING)
+    except json.JSONDecodeError:
+        raise ValueError("MODEL_PALETTE in .env file is not a valid JSON string.")
+
+except ValueError as e:
+    logger.critical(f"Configuration Error: {e}")
+    logger.critical("Please check your .env file. The application cannot start.")
+    import sys
+    sys.exit(1)
 
 app = FastAPI(
     title="Mothr API",
@@ -243,12 +268,12 @@ async def update_available_models():
     global AVAILABLE_MODELS
     
     palette_models = []
-    for m in ROUTER_MODEL_PALETTE:
+    for m in MODEL_PALETTE:
         model_id = m.get("model_name")
         if model_id:
             # Apply alias if it exists for display purposes
             display_id = MODEL_ALIASES.get(model_id, model_id)
-            palette_models.append(Model(id=display_id, owned_by="openrouter"))
+            palette_models.append(Model(id=display_id, owned_by="provider"))
 
     # Combine base models with aliased palette models
     combined_models = AVAILABLE_MODELS + palette_models
@@ -339,19 +364,23 @@ async def run_tasks_with_rate_limit(tasks: List[Any], limit: int, session_logger
         batch_results = await asyncio.gather(*chunk)
         all_results.extend(batch_results)
         
-        # If this is not the last batch, wait for 60 seconds
+        # If this is not the last batch, wait for 60 seconds with a real-time countdown.
         if i + limit < len(tasks):
-            session_logger.info(f"Batch {batch_num} complete. Waiting for 60 seconds before next batch...")
-            await asyncio.sleep(60)
+            wait_duration = 60
+            session_logger.info(f"Batch {batch_num} complete. Rate limit cooldown. Waiting for {wait_duration} seconds.")
+
+            for remaining in range(wait_duration, 0, -1):
+                session_logger.info(f"... {remaining} seconds remaining ...")
+                await asyncio.sleep(1)
+
+            session_logger.info("Cooldown complete. Resuming tasks.")
 
     session_logger.info("All rate-limited batches have been processed.")
     return all_results
 
-async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any]):
-    """Calls the OpenRouter API for a single response using the openai library."""
+async def call_openai_agent(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any]):
+    """Calls the OpenAI-compatible API for a single response using the openai library."""
     session_logger.info(f"--- Calling Agent: {agent_name} (Model: {model_name}, Key: ...{api_key[-4:]}) ---")
-    max_retries = 7
-    retry_delay = 2
     last_exception = None
 
     client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=api_key)
@@ -362,9 +391,9 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
     payload = {"model": model_name, "messages": messages, **generation_config}
     session_logger.debug(f"Agent '{agent_name}' Request Payload:\n{json.dumps(payload, indent=2)}")
 
-    for attempt in range(max_retries):
+    for attempt in range(MAX_RETRIES):
         try:
-            session_logger.info(f"Agent '{agent_name}': Attempt {attempt + 1}/{max_retries}")
+            session_logger.info(f"Agent '{agent_name}': Attempt {attempt + 1}/{MAX_RETRIES}")
             response = await client.chat.completions.create(**payload)
             session_logger.debug(f"Agent '{agent_name}' Full API Response:\n{response.model_dump_json(indent=2)}")
 
@@ -383,30 +412,30 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
             }
         except json.JSONDecodeError as e:
             last_exception = e
-            session_logger.warning(f"Agent '{agent_name}' failed on attempt {attempt + 1}/{max_retries} with JSONDecodeError. Retrying as requested... Error: {e}")
-            if attempt < max_retries - 1:
-                session_logger.info(f"Retrying in {retry_delay} seconds...")
-                await asyncio.sleep(retry_delay)
+            session_logger.warning(f"Agent '{agent_name}' failed on attempt {attempt + 1}/{MAX_RETRIES} with JSONDecodeError. Retrying as requested... Error: {e}")
+            if attempt < MAX_RETRIES - 1:
+                session_logger.info(f"Retrying in {RETRY_DELAY} seconds...")
+                await asyncio.sleep(RETRY_DELAY)
         except (RateLimitError, BadRequestError) as e:
             last_exception = e
-            session_logger.warning(f"Agent '{agent_name}' failed on attempt {attempt + 1}/{max_retries} with a client error. Error: {e}")
+            session_logger.warning(f"Agent '{agent_name}' failed on attempt {attempt + 1}/{MAX_RETRIES} with a client error. Error: {e}")
             break
         except APIError as e:
             last_exception = e
-            session_logger.warning(f"Agent '{agent_name}' failed on attempt {attempt + 1}/{max_retries} with an API error. Error: {e}")
-            if attempt < max_retries - 1:
-                session_logger.info(f"Retrying in {retry_delay} seconds...")
-                await asyncio.sleep(retry_delay)
+            session_logger.warning(f"Agent '{agent_name}' failed on attempt {attempt + 1}/{MAX_RETRIES} with an API error. Error: {e}")
+            if attempt < MAX_RETRIES - 1:
+                session_logger.info(f"Retrying in {RETRY_DELAY} seconds...")
+                await asyncio.sleep(RETRY_DELAY)
         except Exception as e:
             last_exception = e
             session_logger.error(f"An unexpected error occurred for agent '{agent_name}': {e}", exc_info=True)
             break
 
-    session_logger.error(f"Agent '{agent_name}' failed after {attempt + 1} attempts. Last error: {last_exception}")
-    return {"agent": agent_name, "status": "error", "error": f"Failed after {attempt + 1} retries: {last_exception}", "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    session_logger.error(f"Agent '{agent_name}' failed after {MAX_RETRIES} attempts. Last error: {last_exception}")
+    return {"agent": agent_name, "status": "error", "error": f"Failed after {MAX_RETRIES} retries: {last_exception}", "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any]) -> AsyncGenerator[bytes, None]:
-    """Calls the OpenRouter API in streaming mode using the openai library and yields SSE-formatted chunks."""
+async def call_openai_agent_stream(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any]) -> AsyncGenerator[bytes, None]:
+    """Calls the OpenAI-compatible API in streaming mode using the openai library and yields SSE-formatted chunks."""
     session_logger.info(f"--- Calling Agent (Stream): {agent_name} (Model: {model_name}, Key: ...{api_key[-4:]}) ---")
     
     client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=api_key)
@@ -437,7 +466,7 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
     Uses a small AI model to select a specific execution model for each agent based on a detailed scoring rubric.
     Tries up to 3 times, then falls back to a default high-tier configuration.
     """
-    session_logger.info("--- Getting per-agent model configuration from Advanced AI Router ---")
+    session_logger.info("--- Getting per-agent model configuration from Routing AI ---")
     
     agent_descriptions = {
         "factual_analyst": "Analyzes data, focuses on objective facts and stats.",
@@ -469,7 +498,7 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
         
         f"\n\nUSER QUESTION:\n'''{user_question}'''"
         f"\n\nAGENT ROLES:\n{json.dumps(agent_descriptions, indent=2)}"
-        f"\n\nAVAILABLE MODELS (PALETTE):\n{json.dumps(ROUTER_MODEL_PALETTE, indent=2)}"
+        f"\n\nAVAILABLE MODELS (PALETTE):\n{json.dumps(MODEL_PALETTE, indent=2)}"
         "\n\nYour JSON Response:"
     )
     
@@ -478,11 +507,11 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
 
     for attempt in range(max_retries):
         try:
-            session_logger.info(f"Attempting to get agent config from AI Router. Attempt {attempt + 1}/{max_retries}")
-            client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=next(api_key_rotator))
+            session_logger.info(f"Attempting to get agent config from Routing AI. Attempt {attempt + 1}/{max_retries}")
+            client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=next(openai_api_key_rotator))
             
             response = await client.chat.completions.create(
-                model=ROUTER_MODEL,
+                model=ROUTING_MODEL,
                 messages=[{"role": "user", "content": router_prompt}],
                 temperature=0,
                 response_format={"type": "json_object"}
@@ -492,28 +521,28 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
             router_output = json.loads(response_text)
 
             if "reasoning" not in router_output or "model_config" not in router_output:
-                raise ValueError("Router response missing 'reasoning' or 'model_config' keys.")
+                raise ValueError("Routing AI response missing 'reasoning' or 'model_config' keys.")
             
             model_config = router_output["model_config"]
             reasoning = router_output["reasoning"]
 
             required_keys = set(agent_descriptions.keys())
             if set(model_config.keys()) != required_keys:
-                raise ValueError(f"Router model_config has incorrect keys. Expected: {required_keys}")
+                raise ValueError(f"Routing AI model_config has incorrect keys. Expected: {required_keys}")
 
-            session_logger.info(f"AI Router Reasoning: {reasoning}")
-            session_logger.info(f"AI Router selected model config: {model_config}")
+            session_logger.info(f"Routing AI Reasoning: {reasoning}")
+            session_logger.info(f"Routing AI selected model config: {model_config}")
             return model_config # Success, exit the function
 
         except Exception as e:
-            session_logger.warning(f"AI Router failed on attempt {attempt + 1}. Error: {e}.")
+            session_logger.warning(f"Routing AI failed on attempt {attempt + 1}. Error: {e}.")
             if attempt < max_retries - 1:
                 session_logger.info(f"Retrying in {retry_delay} seconds...")
                 await asyncio.sleep(retry_delay)
 
     # This part is only reached if the loop completes without a successful return
-    session_logger.error(f"AI Router failed after {max_retries} attempts. Falling back to default configuration.")
-    default_model = OPENROUTER_MODEL_NAME
+    session_logger.error(f"Routing AI failed after {max_retries} attempts. Falling back to default configuration.")
+    default_model = OPENAI_DEFAULT_MODEL_NAME
     fallback_config = {agent: default_model for agent in agent_descriptions.keys()}
     fallback_config["master_synthesizer"] = default_model # Ensure synthesizer is included
     session_logger.info(f"Using fallback configuration: {fallback_config}")
@@ -550,11 +579,11 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
     if requested_model in REVERSE_MODEL_ALIASES:
         session_logger.info(f"Alias '{requested_model}' detected. Validating original model '{model_to_validate_and_call}'.")
 
-    # 2. Validate against the ground truth: the ROUTER_MODEL_PALETTE from .env
+    # 2. Validate against the ground truth: the MODEL_PALETTE from .env
     # Also allow the special 'ra-1' and 'ra-1-pro' models.
-    valid_original_models = [m["model_name"] for m in ROUTER_MODEL_PALETTE] + ["ra-1", "ra-1-pro"]
+    valid_original_models = [m["model_name"] for m in MODEL_PALETTE] + ["ra-1", "ra-1-pro"]
     if model_to_validate_and_call not in valid_original_models:
-        session_logger.warning(f"Validation failed. Model '{model_to_validate_and_call}' is not in the configured ROUTER_MODEL_PALETTE.")
+        session_logger.warning(f"Validation failed. Model '{model_to_validate_and_call}' is not in the configured MODEL_PALETTE.")
         raise HTTPException(status_code=404, detail=f"Model not found: {requested_model}")
 
     # 3. Set the request model to the original ID for the API call.
@@ -587,13 +616,13 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                 if chat_request.model == "ra-1":
                     model_config = await get_agent_model_config(session_logger, user_question)
                 elif chat_request.model == "ra-1-pro":
-                    default_model = OPENROUTER_MODEL_NAME
+                    default_model = OPENAI_DEFAULT_MODEL_NAME
                     model_config = {agent: default_model for agent in AGENT_PROMPTS.keys()}
                     model_config["master_synthesizer"] = default_model
                     session_logger.info(f"Executing 'ra-1-pro' stream with static config: {model_config}")
                 
                 if model_config:
-                    agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), model_config[name], prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
+                    agent_tasks = [call_openai_agent(session_logger, name, next(openai_api_key_rotator), model_config[name], prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
                     # ** RATE LIMITING LOGIC APPLIED HERE **
                     agent_results = await run_tasks_with_rate_limit(agent_tasks, RATE_LIMIT_PER_MINUTE, session_logger)
 
@@ -611,7 +640,7 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                     )
                     synthesizer_messages = [ChatMessage(role="user", content=synthesizer_user_prompt)]
                     
-                    stream = call_openrouter_agent_stream(session_logger, "master_synthesizer", next(api_key_rotator), model_config["master_synthesizer"], "You are a master synthesizer.", synthesizer_messages, generation_config)
+                    stream = call_openai_agent_stream(session_logger, "master_synthesizer", next(openai_api_key_rotator), model_config["master_synthesizer"], "You are a master synthesizer.", synthesizer_messages, generation_config)
                     async for chunk in stream:
                         yield chunk
                 else:
@@ -628,7 +657,7 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                         else:
                             user_messages.append(msg)
                     system_prompt = "".join(system_prompt_parts)
-                    stream = call_openrouter_agent_stream(session_logger, f"streaming_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
+                    stream = call_openai_agent_stream(session_logger, f"streaming_{chat_request.model}", next(openai_api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
                     async for chunk in stream:
                         yield chunk
 
@@ -644,13 +673,13 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
         if chat_request.model == "ra-1":
             model_config = await get_agent_model_config(session_logger, user_question)
         elif chat_request.model == "ra-1-pro":
-            default_model = OPENROUTER_MODEL_NAME
+            default_model = OPENAI_DEFAULT_MODEL_NAME
             model_config = {agent: default_model for agent in AGENT_PROMPTS.keys()}
             model_config["master_synthesizer"] = default_model
             session_logger.info(f"Executing 'ra-1-pro' workflow with static config: {model_config}")
 
         if model_config:
-            agent_tasks = [call_openrouter_agent(session_logger, name, next(api_key_rotator), model_config[name], prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
+            agent_tasks = [call_openai_agent(session_logger, name, next(openai_api_key_rotator), model_config[name], prompt, chat_request.messages, generation_config) for name, prompt in AGENT_PROMPTS.items()]
             # ** RATE LIMITING LOGIC APPLIED HERE **
             agent_results = await run_tasks_with_rate_limit(agent_tasks, RATE_LIMIT_PER_MINUTE, session_logger)
 
@@ -671,7 +700,7 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                 holistic_thinker_response=successful_responses.get("holistic_thinker", "")
             )
             synthesizer_messages = [ChatMessage(role="user", content=synthesizer_user_prompt)]
-            synthesizer_result = await call_openrouter_agent(session_logger, "master_synthesizer", next(api_key_rotator), model_config["master_synthesizer"], "You are a master synthesizer.", synthesizer_messages, generation_config)
+            synthesizer_result = await call_openai_agent(session_logger, "master_synthesizer", next(openai_api_key_rotator), model_config["master_synthesizer"], "You are a master synthesizer.", synthesizer_messages, generation_config)
 
             if synthesizer_result["status"] == "error":
                 raise HTTPException(status_code=500, detail=f"Master synthesizer failed: {synthesizer_result['error']}")
@@ -696,7 +725,7 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                     user_messages.append(msg)
             system_prompt = "".join(system_prompt_parts)
             
-            direct_result = await call_openrouter_agent(session_logger, f"direct_passthrough_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
+            direct_result = await call_openai_agent(session_logger, f"direct_passthrough_{chat_request.model}", next(openai_api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
 
             if direct_result["status"] == "error":
                 raise HTTPException(status_code=500, detail=f"Direct model call failed: {direct_result['error']}")
@@ -721,8 +750,9 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
+    import sys
     
-    # --- ARGUMENT PARSING FOR RATE LIMITING ---
+    # --- ARGUMENT PARSING ---
     parser = argparse.ArgumentParser(description="Run the Mothr API FastAPI server.")
     parser.add_argument(
         "--rpm",
@@ -730,14 +760,54 @@ if __name__ == "__main__":
         default=0,
         help="Requests Per Minute. Sets a rate limit for concurrent agent calls within a single request. Default is 0 (unlimited)."
     )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to run the API server on. Ports below 1024 require root access."
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="Maximum number of retries for a failed agent call. Max 100."
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=int,
+        default=10,
+        help="Seconds to wait between retries for a failed agent call."
+    )
     args = parser.parse_args()
 
+    # --- VALIDATION AND CONFIGURATION SETUP ---
+    # Port validation
+    if args.port < 1024 and os.geteuid() != 0:
+        logger.error(f"Port {args.port} is a privileged port. You must run this script with sudo or as root to use it.")
+        sys.exit(1)
+        
+    # Retry validation
+    if not 1 <= args.max_retries <= 100:
+        logger.error(f"Max retries must be between 1 and 100. You provided: {args.max_retries}")
+        sys.exit(1)
+
+    if args.retry_delay < 0:
+        logger.error(f"Retry delay cannot be negative. You provided: {args.retry_delay}")
+        sys.exit(1)
+
+    # Set global configurations from args
     RATE_LIMIT_PER_MINUTE = args.rpm
+    MAX_RETRIES = args.max_retries
+    RETRY_DELAY = args.retry_delay
+
     if RATE_LIMIT_PER_MINUTE > 0:
         logger.info(f"🚀 Rate limiting enabled: {RATE_LIMIT_PER_MINUTE} requests per minute.")
     else:
         logger.info("🚀 Rate limiting is disabled.")
     
+    logger.info(f"🔁 Agent retry policy: {MAX_RETRIES} max retries with a {RETRY_DELAY}-second delay.")
+
+    # --- SERVER START ---
     log_config = uvicorn.config.LOGGING_CONFIG
     log_config["formatters"]["default"]["fmt"] = "%(asctime)s - %(levelname)s - %(message)s"
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_config=log_config)
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_config=log_config)
