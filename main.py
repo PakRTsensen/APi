@@ -71,9 +71,10 @@ RATE_LIMIT_PER_MINUTE = 0
 # Core Keys
 PROXY_AUTH_KEY_STRING = os.getenv("PROXY_AUTH_KEY")
 OPENROUTER_API_KEY_STRING = os.getenv("OPENROUTER_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 
-if not PROXY_AUTH_KEY_STRING or not OPENROUTER_API_KEY_STRING:
-    raise ValueError("PROXY_AUTH_KEY and OPENROUTER_API_KEY must be set in the .env file.")
+if not PROXY_AUTH_KEY_STRING or not OPENROUTER_API_KEY_STRING or not OPENAI_BASE_URL:
+    raise ValueError("PROXY_AUTH_KEY, OPENROUTER_API_KEY, and OPENAI_BASE_URL must be set in the .env file.")
 
 # Parse multiple proxy keys
 VALID_PROXY_KEYS = {key.strip() for key in PROXY_AUTH_KEY_STRING.split(',') if key.strip()}
@@ -353,7 +354,7 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
     retry_delay = 2
     last_exception = None
 
-    client = AsyncOpenAI(base_url="http://localhost:11434/v1/", api_key=api_key)
+    client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=api_key)
     
     messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend([msg.model_dump() for msg in user_messages])
@@ -408,7 +409,7 @@ async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_nam
     """Calls the OpenRouter API in streaming mode using the openai library and yields SSE-formatted chunks."""
     session_logger.info(f"--- Calling Agent (Stream): {agent_name} (Model: {model_name}, Key: ...{api_key[-4:]}) ---")
     
-    client = AsyncOpenAI(base_url="http://localhost:11434/v1/", api_key=api_key)
+    client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=api_key)
     
     messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend([msg.model_dump() for msg in user_messages])
@@ -478,7 +479,7 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
     for attempt in range(max_retries):
         try:
             session_logger.info(f"Attempting to get agent config from AI Router. Attempt {attempt + 1}/{max_retries}")
-            client = AsyncOpenAI(base_url="http://localhost:11434/v1/", api_key=next(api_key_rotator))
+            client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=next(api_key_rotator))
             
             response = await client.chat.completions.create(
                 model=ROUTER_MODEL,
