@@ -687,7 +687,11 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
     session_id = str(uuid.uuid4())
     session_logger = setup_session_logger(session_id, authenticated_proxy_key)
     
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as e:
+        session_logger.error(f"Invalid JSON body: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {e}")
     session_logger.info(f"--- START SESSION: {session_id} (Proxy Key: {authenticated_proxy_key}) ---")
     session_logger.debug(f"Full Request Body:\n{json.dumps(body, indent=2)}")
 
