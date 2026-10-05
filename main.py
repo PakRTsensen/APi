@@ -7,6 +7,7 @@ import uuid
 import json
 import itertools
 import argparse
+from collections import OrderedDict
 from typing import List, Dict, Any, Optional, AsyncGenerator
 import logging
 
@@ -68,12 +69,13 @@ load_dotenv()
 # Engine Hijarki (opsional di-runtime): jika hijarki.py tidak tersedia, model
 # hijarki-* tetap terdaftar namun permintaan memakainya ditolak dengan 503.
 try:
-    from hijarki import discover_profiles, load_profile, run_hijarki
+    from hijarki import discover_profiles, load_profile, run_hijarki, HijarkiResult
     HIJARKI_AVAILABLE = True
 except ImportError:
     HIJARKI_AVAILABLE = False
     logger = logging.getLogger("RA-1")
     logger.warning("hijarki.py tidak ditemukan; model hijarki-* tidak tersedia.")
+    HijarkiResult = None  # type: ignore
 
 # Global variable for rate limiting, to be set at startup
 RATE_LIMIT_PER_MINUTE = 0 
@@ -561,6 +563,11 @@ def extract_user_question(chat_request: ChatCompletionRequest) -> str:
     return user_question
 
 
+def _sse_progress_chunk(text: str, model: str) -> bytes:
+    """Chunk SSE role-less dengan teks progress (keep-alive), sesuai SSE spec."""
+    return f'data: {{"id":"chatcmpl-progress","object":"chat.completion.chunk","created":{int(time.time())},"model":"{model}","choices":[{{"index":0,"delta":{{"role":"assistant","content":{json.dumps(text)}}},"finish_reason":null}}]}}\n\n'.encode("utf-8")
+
+
 async def handle_hijarki(
     *,
     chat_request: ChatCompletionRequest,
@@ -568,15 +575,18 @@ async def handle_hijarki(
     session_id: str,
     session_logger: logging.Logger,
 ):
-    """Menjalankan workflow Hijarki (config-driven multi-agent) dan mengembalikan
-    response OpenAI-compatible NON-streaming. Output = teks respon Master saja."""
+    """Menjalankan workflow Hijarki (config-driven multi-agent).
+
+    - Non-streaming: response OpenAI-compatible biasa, output = teks Master saja.
+    - Streaming (stream: true): SSE keep-alive — setiap KEEPALIVE_INTERVAL detik
+      server mengirim teks "Praxis still thinking..." selama pipeline belum selesai.
+      Response BARU ditutup (dengan konten final Master lalu [DONE]) ketika Buffer
+      Zone selesai diproses, sehingga client yang timeout 30-60 dtk tidak putus.
+    """
     profile_name = requested_model[len("hijarki-"):]
 
     if not HIJARKI_AVAILABLE:
         raise HTTPException(status_code=503, detail="Hijarki engine tidak tersedia (hijarki.py tidak terimpor).")
-
-    if chat_request.stream:
-        raise HTTPException(status_code=400, detail="Streaming tidak didukung untuk model hijarki-*.")
 
     profile = load_profile(profile_name)
     if profile is None:
@@ -609,17 +619,50 @@ async def handle_hijarki(
             system_prompt, chat_msgs, generation_config,
         )
 
-    result = await run_hijarki(
-        profile=profile,
-        user_question=user_question,
-        user_messages=user_messages,
-        session_logger=session_logger,
-        generation_config=generation_config,
-        caller=hijarki_caller,
-        fallback_model=OPENROUTER_MODEL_NAME,
-        notes_path=notes_path,
-    )
+    async def _run_pipeline() -> "HijarkiResult":
+        return await run_hijarki(
+            profile=profile,
+            user_question=user_question,
+            user_messages=user_messages,
+            session_logger=session_logger,
+            generation_config=generation_config,
+            caller=hijarki_caller,
+            fallback_model=OPENROUTER_MODEL_NAME,
+            notes_path=notes_path,
+        )
 
+    # --- Streaming: buka koneksi langsung, kirim keep-alive tiap interval, tutup saat selesai ---
+    if chat_request.stream:
+        interval = float(os.getenv("HIJARKI_KEEPALIVE_INTERVAL", "15"))
+
+        async def hijarki_stream_generator():
+            pipeline_task = asyncio.create_task(_run_pipeline())
+            try:
+                while not pipeline_task.done():
+                    yield _sse_progress_chunk("Praxis still thinking...", requested_model)
+                    try:
+                        await asyncio.wait_for(asyncio.shield(pipeline_task), timeout=interval)
+                    except asyncio.TimeoutError:
+                        continue
+                result = pipeline_task.result()
+            except asyncio.CancelledError:
+                session_logger.info("Hijarki stream dibatalkan client (client disconnected).")
+                if not pipeline_task.done():
+                    pipeline_task.cancel()
+                raise
+            except Exception as exc:
+                session_logger.error(f"Hijarki pipeline error: {exc}", exc_info=True)
+                result = HijarkiResult(final_content=f"[Hijarki error: {exc}]", buffer=OrderedDict(), prompt_tokens=0, completion_tokens=0)
+                yield _sse_progress_chunk("Praxis masih berpikir...", requested_model)
+            session_logger.info(f"--- Hijarki selesai: buffer size {len(result.buffer)} ---")
+            # Respon final setelah Buffer Zone tuntas + [DONE]
+            yield f'data: {{"id":"chatcmpl-{uuid.uuid4().hex}","object":"chat.completion.chunk","created":{int(time.time())},"model":"{requested_model}","choices":[{{"index":0,"delta":{{"role":"assistant","content":{json.dumps(result.final_content)}}},"finish_reason":"stop"}}]}}\n\n'.encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(hijarki_stream_generator(), media_type="text/event-stream")
+
+    # --- Non-streaming ---
+    result = await _run_pipeline()
     session_logger.info(f"--- Hijarki selesai: buffer size {len(result.buffer)} ---")
     session_logger.info(f"Empty Master? {not result.final_content.strip()}")
 
