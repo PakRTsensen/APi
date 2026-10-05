@@ -1,4 +1,5 @@
 .env
 logs/
+sessions/
 __pycache__/
 *.pyc

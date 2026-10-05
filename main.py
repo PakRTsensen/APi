@@ -65,9 +65,23 @@ def setup_session_logger(session_id: str, proxy_key: str) -> logging.Logger:
 # --- 1. Configuration & Initialization ---
 load_dotenv()
 
+# Engine Hijarki (opsional di-runtime): jika hijarki.py tidak tersedia, model
+# hijarki-* tetap terdaftar namun permintaan memakainya ditolak dengan 503.
+try:
+    from hijarki import discover_profiles, load_profile, run_hijarki
+    HIJARKI_AVAILABLE = True
+except ImportError:
+    HIJARKI_AVAILABLE = False
+    logger = logging.getLogger("RA-1")
+    logger.warning("hijarki.py tidak ditemukan; model hijarki-* tidak tersedia.")
+
 # Global variable for rate limiting, to be set at startup
 RATE_LIMIT_PER_MINUTE = 0 
 
+# Base URL untuk semua panggilan model (default: endpoint lokal gaya Ollama).
+# Dapat di-override via env OPENAI_BASE_URL untuk menunjuk API apa pun
+# yang kompatibel dengan OpenAI (mis. gateway OpenRouter/anthropic).
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1/")
 # Core Keys
 PROXY_AUTH_KEY_STRING = os.getenv("PROXY_AUTH_KEY")
 OPENROUTER_API_KEY_STRING = os.getenv("OPENROUTER_API_KEY")
@@ -139,20 +153,14 @@ def get_model_aliases() -> Dict[str, str]:
     return aliases
 
 # --- 2. Pydantic Models ---
-class TextContentPart(BaseModel):
-    type: str = "text"
-    text: str
-
-class ImageUrl(BaseModel):
-    url: str
-
-class ImageContentPart(BaseModel):
-    type: str = "image_url"
-    image_url: ImageUrl
-
+# ChatMessage bersifat PERMISSIVE (pass-through): `content` dapat berupa str atau
+# list dict part apa pun yang sah di standar OpenAI-compatible (image_url, input_audio,
+# file, dst.). Part tidak dimodelkan secara ketat agar TIDAK difilter/dimodifikasi —
+# apa pun yang diterima model akan diteruskan verbatim. Field ekstra juga diizinkan.
 class ChatMessage(BaseModel):
+    model_config = {"extra": "allow"}
     role: str
-    content: str | List[TextContentPart | ImageContentPart]
+    content: str | List[dict]
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -251,6 +259,14 @@ async def update_available_models():
 
     # Combine base models with aliased palette models
     combined_models = AVAILABLE_MODELS + palette_models
+
+    # Register Hijarki virtual models (config-driven, dynamic multi-agent profiles)
+    if HIJARKI_AVAILABLE:
+        try:
+            for stub in discover_profiles():
+                combined_models.append(Model(id=f"hijarki-{stub}", owned_by="hijarki"))
+        except Exception as e:
+            logger.warning(f"Failed to discover hijarki profiles: {e}")
     
     # Use a dictionary to handle potential duplicates
     model_dict = {model.id: model for model in combined_models}
@@ -353,7 +369,7 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
     retry_delay = 2
     last_exception = None
 
-    client = AsyncOpenAI(base_url="http://localhost:11434/v1/", api_key=api_key)
+    client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=api_key)
     
     messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend([msg.model_dump() for msg in user_messages])
@@ -408,7 +424,7 @@ async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_nam
     """Calls the OpenRouter API in streaming mode using the openai library and yields SSE-formatted chunks."""
     session_logger.info(f"--- Calling Agent (Stream): {agent_name} (Model: {model_name}, Key: ...{api_key[-4:]}) ---")
     
-    client = AsyncOpenAI(base_url="http://localhost:11434/v1/", api_key=api_key)
+    client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=api_key)
     
     messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend([msg.model_dump() for msg in user_messages])
@@ -478,7 +494,7 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
     for attempt in range(max_retries):
         try:
             session_logger.info(f"Attempting to get agent config from AI Router. Attempt {attempt + 1}/{max_retries}")
-            client = AsyncOpenAI(base_url="http://localhost:11434/v1/", api_key=next(api_key_rotator))
+            client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=next(api_key_rotator))
             
             response = await client.chat.completions.create(
                 model=ROUTER_MODEL,
@@ -518,6 +534,105 @@ async def get_agent_model_config(session_logger: logging.Logger, user_question: 
     session_logger.info(f"Using fallback configuration: {fallback_config}")
     return fallback_config
 
+def extract_user_question(chat_request: ChatCompletionRequest) -> str:
+    """Mengambil teks pesan user terakhir untuk konteks/pemicu prompt.
+
+    File/attachment TIDAK dikeluarkan dari payload asli — hanya dipakai untuk
+    mengetahui teks pertanyaan. Pesan multimedia/user tanpa teks menghasilkan
+    placeholder.
+    """
+    user_question = ""
+    for msg in reversed(chat_request.messages):
+        if msg.role == 'user':
+            if isinstance(msg.content, str):
+                user_question = msg.content
+                break
+            elif isinstance(msg.content, list):
+                for part in msg.content:
+                    if isinstance(part, dict):
+                        text = part.get("text")
+                        if isinstance(text, str) and text.strip():
+                            user_question = text
+                            break
+            if user_question:
+                break
+    if not user_question.strip():
+        user_question = "[Pesan multimedia/attachment tanpa teks]"
+    return user_question
+
+
+async def handle_hijarki(
+    *,
+    chat_request: ChatCompletionRequest,
+    requested_model: str,
+    session_id: str,
+    session_logger: logging.Logger,
+):
+    """Menjalankan workflow Hijarki (config-driven multi-agent) dan mengembalikan
+    response OpenAI-compatible NON-streaming. Output = teks respon Master saja."""
+    profile_name = requested_model[len("hijarki-"):]
+
+    if not HIJARKI_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Hijarki engine tidak tersedia (hijarki.py tidak terimpor).")
+
+    if chat_request.stream:
+        raise HTTPException(status_code=400, detail="Streaming tidak didukung untuk model hijarki-*.")
+
+    profile = load_profile(profile_name)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {requested_model}")
+
+    session_logger.info(f"--- Hijarki workflow: profil '{profile_name}' (sub-agents: {len(profile.get('sub_agents', []))}) ---")
+
+    generation_config = {"temperature": chat_request.temperature}
+    if chat_request.max_tokens:
+        generation_config["max_tokens"] = chat_request.max_tokens
+
+    user_question = extract_user_question(chat_request)
+
+    # Pass-through verbatim: semua pesan user (semua role selain system) diteruskan
+    # apa adanya sebagai dict — engine tidak memodifikasinya.
+    user_messages = [msg.model_dump() for msg in chat_request.messages if msg.role != "system"]
+
+    # Catatan sesi (glosarium) persisten per percakapan.
+    notes_path = os.path.join("sessions", f"{session_id}.jsonl")
+    try:
+        os.makedirs("sessions", exist_ok=True)
+    except OSError:
+        notes_path = None
+
+    async def hijarki_caller(*, agent_name, model_name, system_prompt, messages, generation_config):
+        # Engine mengirim list[dict]; call_openrouter_agent menerima List[ChatMessage].
+        chat_msgs = [ChatMessage(**m) if isinstance(m, dict) else m for m in messages]
+        return await call_openrouter_agent(
+            session_logger, agent_name, next(api_key_rotator), model_name,
+            system_prompt, chat_msgs, generation_config,
+        )
+
+    result = await run_hijarki(
+        profile=profile,
+        user_question=user_question,
+        user_messages=user_messages,
+        session_logger=session_logger,
+        generation_config=generation_config,
+        caller=hijarki_caller,
+        fallback_model=OPENROUTER_MODEL_NAME,
+        notes_path=notes_path,
+    )
+
+    session_logger.info(f"--- Hijarki selesai: buffer size {len(result.buffer)} ---")
+    session_logger.info(f"Empty Master? {not result.final_content.strip()}")
+
+    response_message = OpenAIResponseMessage(content=result.final_content)
+    choice = OpenAIChoice(message=response_message, finish_reason="stop")
+    usage = OpenAIUsage(
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        total_tokens=result.prompt_tokens + result.completion_tokens,
+    )
+    return ChatCompletionResponse(model=requested_model, choices=[choice], usage=usage)
+
+
 # --- 5. API Endpoints ---
 @app.api_route("/v1/models", methods=["GET", "OPTIONS"], response_model=ModelList, dependencies=[Security(get_api_key)])
 async def list_models():
@@ -549,6 +664,15 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
     if requested_model in REVERSE_MODEL_ALIASES:
         session_logger.info(f"Alias '{requested_model}' detected. Validating original model '{model_to_validate_and_call}'.")
 
+    # --- Hijarki branch: virtual, config-driven multi-agent workflow ---
+    if requested_model.startswith("hijarki-"):
+        return await handle_hijarki(
+            chat_request=chat_request,
+            requested_model=requested_model,
+            session_id=session_id,
+            session_logger=session_logger,
+        )
+
     # 2. Validate against the ground truth: the ROUTER_MODEL_PALETTE from .env
     # Also allow the special 'ra-1' and 'ra-1-pro' models.
     valid_original_models = [m["model_name"] for m in ROUTER_MODEL_PALETTE] + ["ra-1", "ra-1-pro"]
@@ -564,19 +688,9 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
     if chat_request.max_tokens:
         generation_config["max_tokens"] = chat_request.max_tokens
 
-    user_question = ""
-    for msg in reversed(chat_request.messages):
-        if msg.role == 'user':
-            if isinstance(msg.content, str):
-                user_question = msg.content
-                break
-            elif isinstance(msg.content, list):
-                for part in msg.content:
-                    if hasattr(part, 'text'):
-                        user_question = part.text
-                        break
-            if user_question:
-                break
+    # Ekstrak teks user terakhir untuk konteks/pemicu prompt. File/attachment TIDAK
+    # dikeluarkan dari payload — hanya dipakai untuk mengetahui teks pertanyaan.
+    user_question = extract_user_question(chat_request)
 
     if chat_request.stream:
         session_logger.info("Streaming response requested.")
