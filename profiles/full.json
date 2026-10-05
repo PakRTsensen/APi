@@ -1,0 +1,35 @@
+{
+  "name": "full",
+  "description": "Hierarki Praxis - 4 layer sub-agent + staf 1 + master + staf 2",
+  "default_model": null,
+  "sub_agents": [
+    {
+      "name": "pemeta",
+      "system_prompt": ""
+    },
+    {
+      "name": "penyintesis",
+      "system_prompt": ""
+    },
+    {
+      "name": "kritikus",
+      "system_prompt": ""
+    },
+    {
+      "name": "praxis",
+      "system_prompt": ""
+    }
+  ],
+  "staf1": {
+    "name": "staf_1",
+    "system_prompt": ""
+  },
+  "master": {
+    "name": "master",
+    "system_prompt": ""
+  },
+  "staf2": {
+    "name": "staf_2",
+    "system_prompt": ""
+  }
+}
