@@ -58,11 +58,29 @@ def _profiles_dir(profiles_dir: Optional[str]) -> str:
     return profiles_dir or DEFAULT_PROFILES_DIR
 
 
+def _is_valid_profile(data: object) -> bool:
+    """Profil valid bila punya minimal satu agent yang bisa dijalankan.
+
+    Agent dianggap ada bila `sub_agents` berisi minimal satu entri, ATAU salah
+    satu peran staf/master (`staf1`, `master`, `staf2`) ada. Ini mengizinkan
+    profil "master saja" (tanpa sub-agent) tetap terdaftar dan dapat dipanggil.
+    """
+    if not isinstance(data, dict):
+        return False
+    subs = data.get("sub_agents")
+    if isinstance(subs, list) and len(subs) > 0:
+        return True
+    for role in ("staf1", "master", "staf2"):
+        if isinstance(data.get(role), dict):
+            return True
+    return False
+
+
 def discover_profiles(profiles_dir: Optional[str] = None) -> List[str]:
     """Mengembalikan daftar nama profil (stub, tanpa .json) yang valid di folder profil.
 
     Sebuah file dianggap profil valid jika parse JSON-nya sukses dan memiliki
-    `sub_agents` berbentuk list. Hasil diurutkan alfabetis.
+    minimal satu agent (sub-agent atau staf/master). Hasil diurutkan alfabetis.
     """
     directory = _profiles_dir(profiles_dir)
     found: List[str] = []
@@ -78,7 +96,7 @@ def discover_profiles(profiles_dir: Optional[str] = None) -> List[str]:
         except Exception as exc:  # noqa: BLE001 - profil rusak tidak boleh membunuh startup
             logger.warning("Profil %s gagal dibaca: %s", entry, exc)
             continue
-        if isinstance(data, dict) and isinstance(data.get("sub_agents"), list):
+        if _is_valid_profile(data):
             found.append(stub)
     return found
 
@@ -94,8 +112,8 @@ def load_profile(profile_name: str, profiles_dir: Optional[str] = None) -> Optio
     except Exception as exc:  # noqa: BLE001
         logger.warning("Profil %s tidak dapat dimuat: %s", profile_name, exc)
         return None
-    if not isinstance(data, dict) or not isinstance(data.get("sub_agents"), list):
-        logger.warning("Profil %s tidak memiliki sub_agents list.", profile_name)
+    if not _is_valid_profile(data):
+        logger.warning("Profil %s tidak memiliki agent (sub_agents/staf1/master/staf2).", profile_name)
         return None
     return data
 

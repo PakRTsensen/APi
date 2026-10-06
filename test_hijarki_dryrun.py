@@ -159,8 +159,46 @@ async def main() -> None:
     assert models_used["staf_2"] == "model-test", models_used["staf_2"]       # default_model
     print("(h) resolusi model per-agent ok")
 
+    # (i) Profil "master saja" (tanpa sub_agents) valid, terdeteksi, dan berjalan
+    await _test_master_only_profile()
+
     shutil.rmtree(tmpdir, ignore_errors=True)
     print("\nSEMUA PENGUJIAN LULUS ✔")
+
+
+async def _test_master_only_profile() -> None:
+    """Regression: profil tanpa sub_agents (mis. hanya master) tidak boleh ditolak."""
+    profile = {
+        "name": "o",
+        "master": {"name": "master", "system_prompt": "", "model": "model-only"},
+    }
+    assert hijarki._is_valid_profile(profile) is True
+    assert hijarki._is_valid_profile({"sub_agents": []}) is False
+    assert hijarki._is_valid_profile({"sub_agents": [], "staf2": {"name": "s2"}}) is True
+
+    # discover + load dari file master-saja
+    tmp = tempfile.mkdtemp(prefix="hijarki_o_")
+    with open(os.path.join(tmp, "o.json"), "w", encoding="utf-8") as fh:
+        json.dump(profile, fh)
+    assert "o" in hijarki.discover_profiles(tmp), hijarki.discover_profiles(tmp)
+    loaded = hijarki.load_profile("o", tmp)
+    assert loaded is not None
+
+    seen = []
+
+    class Fake:
+        async def __call__(self, **kw):
+            seen.append((kw["agent_name"], kw["model_name"]))
+            return {"agent": kw["agent_name"], "status": "success", "response_text": "M",
+                    "prompt_tokens": 0, "completion_tokens": 0}
+
+    res = await hijarki.run_hijarki(
+        profile=loaded, user_question="q", user_messages=[{"role": "user", "content": "q"}],
+        session_logger=_fake_logger(), generation_config={}, caller=Fake(), fallback_model="fb")
+    assert seen == [("master", "model-only")], seen
+    assert res.final_content == "M"
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("(i) profil master-saja ok")
 
 
 if __name__ == "__main__":
