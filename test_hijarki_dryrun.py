@@ -29,9 +29,10 @@ def make_profile(n_sub: int) -> dict:
     return {
         "name": "test-dynamic",
         "default_model": "model-test",
+        "models": {"staf_1": "model-map-staf1"},
         "sub_agents": sub,
         "staf1": {"name": "staf_1", "system_prompt": "prompt staf1"},
-        "master": {"name": "master", "system_prompt": "prompt master"},
+        "master": {"name": "master", "system_prompt": "prompt master", "model": "model-master-A"},
         "staf2": {"name": "staf_2", "system_prompt": "prompt staf2"},
     }
 
@@ -149,6 +150,14 @@ async def main() -> None:
     # Usage akumulasi
     assert result.prompt_tokens == 90 and result.completion_tokens == 180, (result.prompt_tokens, result.completion_tokens)
     print("(g) token usage terakumulasi ok")
+
+    # (h) Resolusi model per-agent: prioritas model entri > models[nama] > default_model
+    models_used = {c["agent_name"]: c["model_name"] for c in caller.calls}
+    assert models_used["sa_1"] == "model-test", models_used["sa_1"]           # default_model
+    assert models_used["staf_1"] == "model-map-staf1", models_used["staf_1"]  # models map
+    assert models_used["master"] == "model-master-A", models_used["master"]   # model entri
+    assert models_used["staf_2"] == "model-test", models_used["staf_2"]       # default_model
+    print("(h) resolusi model per-agent ok")
 
     shutil.rmtree(tmpdir, ignore_errors=True)
     print("\nSEMUA PENGUJIAN LULUS ✔")

@@ -201,10 +201,31 @@ async def run_hijarki(
 
     notes = _load_notes(notes_path)
 
+    profile_models = profile.get("models") if isinstance(profile.get("models"), dict) else {}
+
+    def _resolve_model(entry: dict, name: str) -> str:
+        """Prioritas model per agent:
+        1. `model` di entri agent itu sendiri
+        2. `models[<name>]` di level profil (map nama agent -> model)
+        3. `default_model` profil
+        4. `fallback_model` yang diberikan pemanggil
+        Nilai kosong/whitespace dianggap tidak diset.
+        """
+        candidates = (
+            entry.get("model"),
+            profile_models.get(name),
+            profile.get("default_model"),
+            fallback_model,
+        )
+        for cand in candidates:
+            if isinstance(cand, str) and cand.strip():
+                return cand.strip()
+        return fallback_model
+
     for idx, entry in enumerate(entries):
         name = entry.get("name") or entry.get("kind") or f"agent_{idx}"
         system_prompt = entry.get("system_prompt") or ""
-        model_name = entry.get("model") or profile.get("default_model") or fallback_model
+        model_name = _resolve_model(entry, name)
 
         # (1) system message dari profil (verbatim), (2) pesan user VERBATIM,
         # (3) konteks tambahan: respon agent yang sudah ada di buffer + catatan sesi.

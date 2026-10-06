@@ -1,35 +1,45 @@
 {
   "name": "full",
-  "description": "Hierarki Praxis - 4 layer sub-agent + staf 1 + master + staf 2",
+  "description": "Hierarki Praxis - 4 layer sub-agent + staf 1 + master + staf 2. Setiap agent boleh memakai model berbeda.",
   "default_model": null,
+  "models": {
+    "_comment": "Map opsional nama-agent -> model. Prioritas: field 'model' di agent > models[nama] > default_model > fallback server."
+  },
   "sub_agents": [
     {
       "name": "pemeta",
-      "system_prompt": ""
+      "system_prompt": "",
+      "model": null
     },
     {
       "name": "penyintesis",
-      "system_prompt": ""
+      "system_prompt": "",
+      "model": null
     },
     {
       "name": "kritikus",
-      "system_prompt": ""
+      "system_prompt": "",
+      "model": null
     },
     {
       "name": "praxis",
-      "system_prompt": ""
+      "system_prompt": "",
+      "model": null
     }
   ],
   "staf1": {
     "name": "staf_1",
-    "system_prompt": ""
+    "system_prompt": "",
+    "model": null
   },
   "master": {
     "name": "master",
-    "system_prompt": ""
+    "system_prompt": "",
+    "model": null
   },
   "staf2": {
     "name": "staf_2",
-    "system_prompt": ""
+    "system_prompt": "",
+    "model": null
   }
 }

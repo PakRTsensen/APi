@@ -49,11 +49,17 @@ not real models; new `hijarki-*` models are the same idea but config-driven.
   everything. Final HTTP output = ONLY master's response text (markdown code fences stripped).
 - Buffer Zone: an in-memory `OrderedDict` holding every agent result (any count); `staf1`,
   `master`, `staf2` read the whole buffer produced before their phase.
+- Per-agent model selection (each agent may use a DIFFERENT model). Resolution order:
+  entry `"model"` → profile `"models"` map keyed by agent name → profile `"default_model"`
+  → `fallback_model` arg (`OPENROUTER_MODEL_NAME`). Blank/whitespace is treated as unset.
 - Context added AFTER user messages as `assistant` messages (`[Respon dari agent "X"]` prefix);
   session notes/glossary as one appended `user` message. User messages are never rewritten.
 - Session notes (glossary) persist per conversation to `sessions/<session_id>.jsonl`
   (`sessions/` gitignored); later turns load prior lines and inject into Master + Staf 2.
-- Non-streaming only: `stream: true` for a `hijarki-*` model → 400.
+- Streaming `stream: true` is supported via SSE keep-alive: server opens the response
+  immediately and emits `"Praxis still thinking..."` chunks every `HIJARKI_KEEPALIVE_INTERVAL`
+  seconds (default 15), then the master's final content + `[DONE]` only after the Buffer Zone
+  completes. Non-streaming returns the same content in one shot.
 - Keep `main.py`'s relay wiring intact: `call_openrouter_agent` expects `List[ChatMessage]`,
   but the engine passes `list[dict]`; the `handle_hijarki` closure converts dicts to
   `ChatMessage` before calling. `user_question` is extracted from the user's last text (only
