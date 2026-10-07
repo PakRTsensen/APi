@@ -313,7 +313,7 @@ def get_model_aliases() -> Dict[str, str]:
 class ChatMessage(BaseModel):
     model_config = {"extra": "allow"}
     role: str
-    content: str | List[dict]
+    content: Optional[str | List[dict]] = None
 
 class ChatCompletionRequest(BaseModel):
     # Pass-through: SEMUA field OpenAI-compatible lain (top_p, top_k, seed, stop,
@@ -335,14 +335,21 @@ class OpenAIResponseMessage(BaseModel):
     tool_calls: Optional[List[Any]] = None
 
 class OpenAIChoice(BaseModel):
+    model_config = {"extra": "allow"}
     index: int = 0
     message: OpenAIResponseMessage
     finish_reason: Optional[str] = "stop"
+    native_finish_reason: Optional[str] = None
 
 class OpenAIUsage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
+    # Pass-through: rincian token (cached_tokens, reasoning_tokens, cost, dll.)
+    # tidak boleh hilang. Field ekstra diizinkan.
+    model_config = {"extra": "allow"}
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    prompt_tokens_details: Optional[Dict[str, Any]] = None
+    completion_tokens_details: Optional[Dict[str, Any]] = None
 
 class ChatCompletionResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
@@ -561,16 +568,28 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
             message = response.choices[0].message
             choice = response.choices[0]
             response_content = message.content or ""
+            # Simpan SELURUH message apa adanya (refusal, annotations, audio,
+            # function_call, tool_calls, reasoning*, dst.) agar tidak ada yang drop.
+            try:
+                raw_message = message.model_dump()
+            except Exception:
+                raw_message = {"role": "assistant", "content": response_content}
             reasoning_text = getattr(message, "reasoning", None)
             reasoning_details = getattr(message, "reasoning_details", None)
             tool_calls = getattr(message, "tool_calls", None)
             finish_reason = getattr(choice, "finish_reason", None) or "stop"
+            native_finish_reason = getattr(choice, "native_finish_reason", None)
             usage = response.usage
             reasoning_tokens = 0
+            usage_details: Optional[Dict[str, Any]] = None
             if usage is not None:
                 details = getattr(usage, "completion_tokens_details", None)
                 if details is not None:
                     reasoning_tokens = getattr(details, "reasoning_tokens", 0) or 0
+                try:
+                    usage_details = usage.model_dump()
+                except Exception:
+                    usage_details = None
 
             if reasoning_details:
                 session_logger.info(
@@ -579,14 +598,17 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
             session_logger.info(f"Agent '{agent_name}' succeeded on attempt {attempt + 1}")
             return {
                 "agent": agent_name, "status": "success", "response_text": response_content,
+                "raw_message": raw_message,
                 "reasoning": reasoning_text,
                 "reasoning_details": reasoning_details,
                 "tool_calls": tool_calls,
                 "finish_reason": finish_reason,
+                "native_finish_reason": native_finish_reason,
                 "prompt_tokens": usage.prompt_tokens if usage else 0,
                 "completion_tokens": usage.completion_tokens if usage else 0,
                 "total_tokens": usage.total_tokens if usage else 0,
                 "reasoning_tokens": reasoning_tokens,
+                "usage_details": usage_details,
             }
         except json.JSONDecodeError as e:
             last_exception = e
@@ -610,7 +632,7 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
             break
 
     session_logger.error(f"Agent '{agent_name}' failed after {attempt + 1} attempts. Last error: {last_exception}")
-    return {"agent": agent_name, "status": "error", "error": f"Failed after {attempt + 1} retries: {last_exception}", "response_text": "", "reasoning": None, "reasoning_details": None, "tool_calls": None, "finish_reason": "error", "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0}
+    return {"agent": agent_name, "status": "error", "error": f"Failed after {attempt + 1} retries: {last_exception}", "response_text": "", "raw_message": None, "reasoning": None, "reasoning_details": None, "tool_calls": None, "finish_reason": "error", "native_finish_reason": None, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0, "usage_details": None}
 
 async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any]) -> AsyncGenerator[bytes, None]:
     """Calls the OpenRouter API in streaming mode using the openai library and yields SSE-formatted chunks."""
@@ -780,6 +802,52 @@ def build_generation_config(body: dict) -> Dict[str, Any]:
     return config
 
 
+def _response_message_from_result(result: dict) -> "OpenAIResponseMessage":
+    """Bangun pesan respons dari hasil agent tanpa menjatuhkan field apa pun.
+
+    Memakai `raw_message` (dump utuh dari upstream) bila ada; jika tidak, fallback
+    ke field-field yang dikurasi. `content` TIDAK dipaksa "" agar tool-call tetap null.
+    """
+    raw = result.get("raw_message")
+    if isinstance(raw, dict):
+        try:
+            return OpenAIResponseMessage.model_validate(raw)
+        except Exception:
+            pass
+    return OpenAIResponseMessage(
+        content=result.get("response_text") if result.get("response_text") != "" else None,
+        reasoning=result.get("reasoning"),
+        reasoning_details=result.get("reasoning_details"),
+        tool_calls=result.get("tool_calls"),
+    )
+
+
+def _usage_from_results(results: List[dict]) -> "OpenAIUsage":
+    """Jumlahkan usage lintas agent, sekaligus pertahankan rincian token."""
+    prompt_tokens = sum(int(r.get("prompt_tokens", 0) or 0) for r in results)
+    completion_tokens = sum(int(r.get("completion_tokens", 0) or 0) for r in results)
+    total_tokens = sum(int(r.get("total_tokens", 0) or 0) for r in results)
+    completion_details: Dict[str, Any] = {}
+    prompt_details: Dict[str, Any] = {}
+    for r in results:
+        details = r.get("usage_details")
+        if not isinstance(details, dict):
+            continue
+        for key, bucket in (("completion_tokens_details", completion_details), ("prompt_tokens_details", prompt_details)):
+            part = details.get(key)
+            if isinstance(part, dict):
+                for k, v in part.items():
+                    if isinstance(v, (int, float)):
+                        bucket[k] = bucket.get(k, 0) + v
+    return OpenAIUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens or (prompt_tokens + completion_tokens),
+        prompt_tokens_details=prompt_details or None,
+        completion_tokens_details=completion_details or None,
+    )
+
+
 def _sse_progress_chunk(text: str, model: str) -> bytes:
     """Chunk SSE role-less dengan teks progress (keep-alive), sesuai SSE spec."""
     return f'data: {{"id":"chatcmpl-progress","object":"chat.completion.chunk","created":{int(time.time())},"model":"{model}","choices":[{{"index":0,"delta":{{"role":"assistant","content":{json.dumps(text)}}},"finish_reason":null}}]}}\n\n'.encode("utf-8")
@@ -875,15 +943,15 @@ async def handle_hijarki(
                 yield _sse_progress_chunk("Praxis masih berpikir...", requested_model)
             session_logger.info(f"--- Hijarki selesai: buffer size {len(result.buffer)} ---")
             # Respon final setelah Buffer Zone tuntas + [DONE]
-            final_delta = {"role": "assistant", "content": result.final_content}
-            if getattr(result, "master_reasoning", None):
-                final_delta["reasoning"] = result.master_reasoning
-            if getattr(result, "master_reasoning_details", None):
-                final_delta["reasoning_details"] = result.master_reasoning_details
-            if getattr(result, "master_tool_calls", None):
-                final_delta["tool_calls"] = result.master_tool_calls
-            final_finish = getattr(result, "master_finish_reason", None) or "stop"
-            yield f'data: {{"id":"chatcmpl-{uuid.uuid4().hex}","object":"chat.completion.chunk","created":{int(time.time())},"model":"{requested_model}","choices":[{{"index":0,"delta":{json.dumps(final_delta, default=str)},"finish_reason":{json.dumps(final_finish)}}}]}}\n\n'.encode("utf-8")
+            master = getattr(result, "master_result", None) or {"response_text": result.final_content}
+            final_delta = {k: v for k, v in master.items() if k not in ("agent", "status", "prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "usage_details", "error", "raw_message")}
+            final_delta.setdefault("role", "assistant")
+            if master.get("raw_message") and not final_delta.get("content"):
+                final_delta["content"] = master.get("response_text")
+            final_finish = master.get("finish_reason") or "stop"
+            native_finish = master.get("native_finish_reason")
+            native_fragment = f',"native_finish_reason":{json.dumps(native_finish)}' if native_finish else ""
+            yield f'data: {{"id":"chatcmpl-{uuid.uuid4().hex}","object":"chat.completion.chunk","created":{int(time.time())},"model":"{requested_model}","choices":[{{"index":0,"delta":{json.dumps(final_delta, default=str)},"finish_reason":{json.dumps(final_finish)}{native_fragment}}}]}}\n\n'.encode("utf-8")
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(hijarki_stream_generator(), media_type="text/event-stream")
@@ -893,18 +961,16 @@ async def handle_hijarki(
     session_logger.info(f"--- Hijarki selesai: buffer size {len(result.buffer)} ---")
     session_logger.info(f"Empty Master? {not result.final_content.strip()}")
 
-    response_message = OpenAIResponseMessage(
-        content=result.final_content,
-        reasoning=getattr(result, "master_reasoning", None),
-        reasoning_details=getattr(result, "master_reasoning_details", None),
-        tool_calls=getattr(result, "master_tool_calls", None),
+    response_message = _response_message_from_result(
+        getattr(result, "master_result", None) or {"response_text": result.final_content}
     )
-    choice = OpenAIChoice(message=response_message, finish_reason=getattr(result, "master_finish_reason", None) or "stop")
-    usage = OpenAIUsage(
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-        total_tokens=result.prompt_tokens + result.completion_tokens,
+    _master = getattr(result, "master_result", None) or {}
+    choice = OpenAIChoice(
+        message=response_message,
+        finish_reason=getattr(result, "master_finish_reason", None) or "stop",
+        native_finish_reason=_master.get("native_finish_reason"),
     )
+    usage = _usage_from_results(list(result.buffer.values()) or [{"prompt_tokens": result.prompt_tokens, "completion_tokens": result.completion_tokens}])
     return ChatCompletionResponse(model=requested_model, choices=[choice], usage=usage)
 
 
@@ -1024,10 +1090,7 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
         session_logger.info("Non-streaming response requested.")
         
         model_config = None
-        final_reasoning = None
-        final_reasoning_details = None
-        final_tool_calls = None
-        final_finish_reason = "stop"
+        final_result: Optional[dict] = None
         if chat_request.model == "ra-1":
             model_config = await get_agent_model_config(session_logger, user_question)
         elif chat_request.model == "ra-1-pro":
@@ -1064,10 +1127,7 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                 raise HTTPException(status_code=500, detail=f"Master synthesizer failed: {synthesizer_result['error']}")
 
             final_content = synthesizer_result["response_text"]
-            final_reasoning = synthesizer_result.get("reasoning")
-            final_reasoning_details = synthesizer_result.get("reasoning_details")
-            final_tool_calls = synthesizer_result.get("tool_calls")
-            final_finish_reason = synthesizer_result.get("finish_reason", "stop")
+            final_result = synthesizer_result
             total_prompt_tokens = sum(res.get("prompt_tokens", 0) for res in agent_results) + synthesizer_result.get("prompt_tokens", 0)
             total_completion_tokens = sum(res.get("completion_tokens", 0) for res in agent_results) + synthesizer_result.get("completion_tokens", 0)
 
@@ -1081,10 +1141,7 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                 raise HTTPException(status_code=500, detail=f"Direct model call failed: {direct_result['error']}")
             
             final_content = direct_result["response_text"]
-            final_reasoning = direct_result.get("reasoning")
-            final_reasoning_details = direct_result.get("reasoning_details")
-            final_tool_calls = direct_result.get("tool_calls")
-            final_finish_reason = direct_result.get("finish_reason", "stop")
+            final_result = direct_result
             total_prompt_tokens = direct_result.get("prompt_tokens", 0)
             total_completion_tokens = direct_result.get("completion_tokens", 0)
 
@@ -1092,14 +1149,13 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
         session_logger.debug(f"Final Output:\n{final_content}")
         session_logger.info(f"--- END SESSION: {session_id} ---")
 
-        response_message = OpenAIResponseMessage(
-            content=final_content,
-            reasoning=final_reasoning,
-            reasoning_details=final_reasoning_details,
-            tool_calls=final_tool_calls,
+        response_message = _response_message_from_result(final_result or {"response_text": final_content})
+        choice = OpenAIChoice(
+            message=response_message,
+            finish_reason=(final_result or {}).get("finish_reason") or "stop",
+            native_finish_reason=(final_result or {}).get("native_finish_reason"),
         )
-        choice = OpenAIChoice(message=response_message, finish_reason=final_finish_reason)
-        usage = OpenAIUsage(prompt_tokens=total_prompt_tokens, completion_tokens=total_completion_tokens, total_tokens=total_prompt_tokens + total_completion_tokens)
+        usage = _usage_from_results(agent_results + [synthesizer_result]) if model_config else _usage_from_results([final_result or {}])
 
         return ChatCompletionResponse(model=chat_request.model, choices=[choice], usage=usage)
 

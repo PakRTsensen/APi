@@ -95,9 +95,11 @@ forwarded VERBATIM. Do not reintroduce filtering:
   are not explicit SDK arguments MUST go through `extra_body`.
 - Direct passthrough paths pass `chat_request.messages` as-is (no system collapsing, no dropping
   image/audio/file parts, no reordering).
-- Responses preserve `content` (nullable), `tool_calls`, real `finish_reason`, `reasoning`,
-  `reasoning_details`; content is never coerced to `""` when the model returns a tool call.
-- `usage` token counts are summed across agents for multi-agent workflows.
+- Responses are rebuilt from the upstream message dump (`raw_message`) so `refusal`, `annotations`,
+  `audio`, `function_call`, etc. survive. `content` (nullable) is never coerced to `""`;
+  `tool_calls` and the real `finish_reason`/`native_finish_reason` are preserved.
+- `usage` token counts are summed across agents; `prompt_tokens_details`/`completion_tokens_details`
+  (cached_tokens, reasoning_tokens, ...) are merged too.
 
 ## Git workflow (required)
 - Active branch: `legacy`. Do NOT commit to `stable`/`experimental` (`origin/HEAD → stable`).

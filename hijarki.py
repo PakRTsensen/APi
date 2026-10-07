@@ -48,6 +48,7 @@ class HijarkiResult:
         "master_reasoning_details",
         "master_tool_calls",
         "master_finish_reason",
+        "master_result",
     )
 
     def __init__(
@@ -60,6 +61,7 @@ class HijarkiResult:
         master_reasoning_details: Optional[list] = None,
         master_tool_calls: Optional[list] = None,
         master_finish_reason: Optional[str] = None,
+        master_result: Optional[dict] = None,
     ) -> None:
         self.final_content = final_content
         self.buffer = buffer
@@ -69,6 +71,7 @@ class HijarkiResult:
         self.master_reasoning_details = master_reasoning_details
         self.master_tool_calls = master_tool_calls
         self.master_finish_reason = master_finish_reason
+        self.master_result = master_result
 
 
 def _profiles_dir(profiles_dir: Optional[str]) -> str:
@@ -374,4 +377,5 @@ async def run_hijarki(
         master_reasoning_details=(master_result or {}).get("reasoning_details"),
         master_tool_calls=(master_result or {}).get("tool_calls"),
         master_finish_reason=(master_result or {}).get("finish_reason"),
+        master_result=master_result,
     )
