@@ -39,7 +39,16 @@ _TRAILING_FENCE = re.compile(r"\n?\s*```\s*$")
 class HijarkiResult:
     """Hasil satu putaran pipeline Hijarki."""
 
-    __slots__ = ("final_content", "buffer", "prompt_tokens", "completion_tokens")
+    __slots__ = (
+        "final_content",
+        "buffer",
+        "prompt_tokens",
+        "completion_tokens",
+        "master_reasoning",
+        "master_reasoning_details",
+        "master_tool_calls",
+        "master_finish_reason",
+    )
 
     def __init__(
         self,
@@ -47,11 +56,19 @@ class HijarkiResult:
         buffer: "OrderedDict[str, dict]",
         prompt_tokens: int,
         completion_tokens: int,
+        master_reasoning: Optional[str] = None,
+        master_reasoning_details: Optional[list] = None,
+        master_tool_calls: Optional[list] = None,
+        master_finish_reason: Optional[str] = None,
     ) -> None:
         self.final_content = final_content
         self.buffer = buffer
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
+        self.master_reasoning = master_reasoning
+        self.master_reasoning_details = master_reasoning_details
+        self.master_tool_calls = master_tool_calls
+        self.master_finish_reason = master_finish_reason
 
 
 def _profiles_dir(profiles_dir: Optional[str]) -> str:
@@ -164,8 +181,20 @@ def _system_message(system_prompt: str) -> Optional[dict]:
     return {"role": "system", "content": system_prompt}
 
 
-def _assistant_message(name: str, response_text: str) -> dict:
-    return {"role": "assistant", "content": f'[Respon dari agent "{name}"]\n{response_text}'}
+def _assistant_message(prev_result: dict, name: str) -> dict:
+    """Pesan konteks assistant untuk agent berikutnya.
+
+    Menyertakan teks respon dengan prefix, DAN meneruskan native
+    `reasoning_details` (urutan persis) bila ada, atau fallback `reasoning`.
+    """
+    text = prev_result.get("response_text") or ""
+    msg: dict = {"role": "assistant", "content": f'[Respon dari agent "{name}"]\n{text}'}
+    details = prev_result.get("reasoning_details")
+    if details:
+        msg["reasoning_details"] = details
+    elif prev_result.get("reasoning"):
+        msg["reasoning"] = prev_result["reasoning"]
+    return msg
 
 
 def _notes_message(lines: List[str]) -> dict:
@@ -220,6 +249,9 @@ async def run_hijarki(
     notes = _load_notes(notes_path)
 
     profile_models = profile.get("models") if isinstance(profile.get("models"), dict) else {}
+    profile_reasoning = profile.get("reasoning") if isinstance(profile.get("reasoning"), dict) else {}
+    default_reasoning = profile.get("default_reasoning")
+    env_reasoning_effort = os.getenv("HIJARKI_REASONING_EFFORT", "").strip() or None
 
     def _resolve_model(entry: dict, name: str) -> str:
         """Prioritas model per agent:
@@ -240,10 +272,32 @@ async def run_hijarki(
                 return cand.strip()
         return fallback_model
 
+    def _resolve_reasoning(entry: dict, name: str) -> Optional[dict]:
+        """Prioritas konfigurasi reasoning per agent:
+        1. `reasoning` di entri agent (str "max" atau objek)
+        2. `reasoning[<name>]` di level profil
+        3. `default_reasoning` profil
+        4. env `HIJARKI_REASONING_EFFORT`
+        """
+        candidates = (
+            entry.get("reasoning"),
+            profile_reasoning.get(name),
+            default_reasoning,
+        )
+        for cand in candidates:
+            if isinstance(cand, str) and cand.strip():
+                return {"effort": cand.strip()}
+            if isinstance(cand, dict) and cand:
+                return dict(cand)
+        if env_reasoning_effort:
+            return {"effort": env_reasoning_effort}
+        return None
+
     for idx, entry in enumerate(entries):
         name = entry.get("name") or entry.get("kind") or f"agent_{idx}"
         system_prompt = entry.get("system_prompt") or ""
         model_name = _resolve_model(entry, name)
+        reasoning_config = _resolve_reasoning(entry, name)
 
         # (1) system message dari profil (verbatim), (2) pesan user VERBATIM,
         # (3) konteks tambahan: respon agent yang sudah ada di buffer + catatan sesi.
@@ -254,14 +308,13 @@ async def run_hijarki(
         # Salinan dangkal — dict pesan user tidak pernah diubah oleh engine.
         messages.extend(list(user_messages))
         for prev_name, prev_result in buffer.items():
-            prev_text = prev_result.get("response_text") or ""
-            messages.append(_assistant_message(prev_name, prev_text))
+            messages.append(_assistant_message(prev_result, prev_name))
         if entry["kind"] in ("master", "staf2") and notes:
             messages.append(_notes_message(notes))
 
         session_logger.info(
-            "Agent '%s' (fase %s, model %s): buffer size %d",
-            name, entry["kind"], model_name, len(buffer),
+            "Agent '%s' (fase %s, model %s, reasoning %s): buffer size %d",
+            name, entry["kind"], model_name, reasoning_config, len(buffer),
         )
 
         result = await caller(
@@ -270,6 +323,7 @@ async def run_hijarki(
             system_prompt=system_prompt,
             messages=messages,
             generation_config=generation_config,
+            reasoning_config=reasoning_config,
         )
         if not isinstance(result, dict):
             result = {"agent": name, "status": "error", "response_text": "", "prompt_tokens": 0, "completion_tokens": 0}
@@ -296,7 +350,14 @@ async def run_hijarki(
             "user_question": user_question,
             "master": (master_result or {}).get("response_text", ""),
             "staf2": (buffer.get("staf2") or {}).get("response_text", ""),
-            "buffer": {bname: bres.get("response_text", "") for bname, bres in buffer.items()},
+            "buffer": {
+                bname: {
+                    "text": bres.get("response_text", ""),
+                    "reasoning": bres.get("reasoning"),
+                    "reasoning_details": bres.get("reasoning_details"),
+                }
+                for bname, bres in buffer.items()
+            },
         }
         _append_note(notes_path, record)
 
@@ -309,4 +370,8 @@ async def run_hijarki(
         buffer=buffer,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        master_reasoning=(master_result or {}).get("reasoning"),
+        master_reasoning_details=(master_result or {}).get("reasoning_details"),
+        master_tool_calls=(master_result or {}).get("tool_calls"),
+        master_finish_reason=(master_result or {}).get("finish_reason"),
     )

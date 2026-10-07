@@ -118,6 +118,157 @@ try:
 except json.JSONDecodeError:
     raise ValueError("ROUTER_MODEL_PALETTE in .env file is not a valid JSON string.")
 
+# --- Reasoning / thinking-trace configuration (OpenRouter) ---
+# max_tokens aman saat effort max/xhigh (wajib > budget 95% pada model Anthropic).
+try:
+    REASONING_MAX_TOKENS = int(os.getenv("HIJARKI_REASONING_MAX_TOKENS", "32000"))
+except ValueError:
+    REASONING_MAX_TOKENS = 32000
+# TTL cache katalog model OpenRouter (detik).
+try:
+    MODEL_CATALOG_TTL = float(os.getenv("MODEL_CATALOG_TTL", "86400"))
+except ValueError:
+    MODEL_CATALOG_TTL = 86400.0
+# Override manual untuk model Claude yang tidak ada di katalog publik (gateway/privat).
+CLAUDE_MODELS_OVERRIDE = {
+    m.strip().lower()
+    for m in os.getenv("CLAUDE_MODELS", "").split(",")
+    if m.strip()
+}
+_OFFLINE_CLAUDE_HINTS = ("anthropic/", "claude", "fable", "opus", "sonnet", "haiku")
+
+_model_catalog: Dict[str, Any] = {"claude_keys": set(), "fetched_at": 0.0}
+
+
+def _harvest_catalog(rows: list) -> None:
+    """Menyaring baris katalog model menjadi himpunan id Claude.
+
+    Dipakai untuk deteksi model tanpa daftar substring statis: key diambil dari
+    id/canonical_slug/alias_target.slug serta metadata arsitektur.
+    """
+    claude_keys = _model_catalog["claude_keys"]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        keys = set()
+        for field in ("id", "canonical_slug"):
+            val = row.get(field)
+            if isinstance(val, str) and val:
+                keys.add(val.lower())
+        alias_target = row.get("alias_target")
+        if isinstance(alias_target, dict) and isinstance(alias_target.get("slug"), str):
+            keys.add(alias_target["slug"].lower())
+        if not keys:
+            continue
+        arch = row.get("architecture") if isinstance(row.get("architecture"), dict) else {}
+        tokenizer = str(arch.get("tokenizer", "")).lower()
+        instruct = str(arch.get("instruct_type", "")).lower()
+        author = next((k.split("/", 1)[0] for k in keys if "/" in k), "")
+        if (
+            tokenizer == "claude"
+            or instruct == "claude"
+            or author == "anthropic"
+            or any("claude" in k for k in keys)
+        ):
+            claude_keys.update(keys)
+
+
+async def _ensure_catalog() -> None:
+    """Memuat katalog model sekali (dengan TTL) dari gateway lalu fallback OpenRouter publik.
+
+    Kegagalan tidak fatal: deteksi jatuh ke heuristik offline.
+    """
+    now = time.time()
+    if _model_catalog["fetched_at"] and (now - _model_catalog["fetched_at"]) < MODEL_CATALOG_TTL:
+        return
+    urls = []
+    if OPENAI_BASE_URL:
+        urls.append(OPENAI_BASE_URL.rstrip("/") + "/models?model_authors=anthropic")
+        urls.append(OPENAI_BASE_URL.rstrip("/") + "/models")
+    urls.append("https://openrouter.ai/api/v1/models?model_authors=anthropic")
+    headers = {}
+    if OPENROUTER_API_KEYS_LIST:
+        headers["Authorization"] = f"Bearer {OPENROUTER_API_KEYS_LIST[0]}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for url in urls:
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    continue
+                payload = resp.json()
+                rows = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(rows, list) and rows:
+                    _harvest_catalog(rows)
+                    _model_catalog["fetched_at"] = now
+                    logger.info(
+                        "Model catalog loaded (%d rows): %d Claude ids.",
+                        len(rows), len(_model_catalog["claude_keys"]),
+                    )
+                    return
+            except Exception as exc:  # noqa: BLE001 - katalog opsional
+                logger.debug("Catalog fetch failed for %s: %s", url, exc)
+    _model_catalog["fetched_at"] = now
+    logger.warning("Model catalog unavailable; falling back to offline Claude heuristics.")
+
+
+def _resolve_slug(model_name: str) -> str:
+    """Memetakan nama model ke slug asli (nama bisa berupa alias reverse)."""
+    if not isinstance(model_name, str):
+        return ""
+    name = model_name.strip().lower()
+    rev = {k.lower(): v.lower() for k, v in REVERSE_MODEL_ALIASES.items()}
+    return rev.get(name, name)
+
+
+def _is_claude_model(model_name: str) -> bool:
+    """True bila model adalah keluarga Claude (katalog, override env, atau heuristik offline)."""
+    slug = _resolve_slug(model_name)
+    if not slug:
+        return False
+    if slug in CLAUDE_MODELS_OVERRIDE or model_name.strip().lower() in CLAUDE_MODELS_OVERRIDE:
+        return True
+    if slug in _model_catalog["claude_keys"]:
+        return True
+    return any(hint in slug for hint in _OFFLINE_CLAUDE_HINTS)
+
+
+def _apply_reasoning(
+    model_name: str,
+    reasoning_config: Optional[dict],
+    generation_config: Dict[str, Any],
+    session_logger: logging.Logger,
+) -> None:
+    """Menyuntikkan `extra_body.reasoning` dan menaikkan max_tokens bila perlu (in-place).
+
+    Model non-Claude/non-reasoning tidak diubah.
+    """
+    if not reasoning_config:
+        return
+    effort = None
+    if isinstance(reasoning_config.get("effort"), str):
+        effort = reasoning_config["effort"].strip().lower()
+
+    # Scope: hanya model keluarga Claude/Fable/Opus yang disentuh.
+    if not _is_claude_model(model_name):
+        session_logger.debug("Reasoning dilewati untuk model non-Claude %s.", model_name)
+        return
+    if effort == "none":
+        return
+
+    if effort in ("max", "xhigh"):
+        max_tokens = generation_config.get("max_tokens")
+        budget = reasoning_config.get("max_tokens")
+        if budget is None:
+            budget = min(int(REASONING_MAX_TOKENS * 0.95), 128000)
+        if not isinstance(max_tokens, int) or max_tokens <= budget:
+            generation_config["max_tokens"] = max(int(budget) + 4096, REASONING_MAX_TOKENS)
+            session_logger.info(
+                "Reasoning effort '%s': max_tokens dinaikkan ke %d (budget %d) untuk model %s.",
+                effort, generation_config["max_tokens"], budget, model_name,
+            )
+    logger.debug("Reasoning aktif untuk %s: %s", model_name, reasoning_config)
+
+
 app = FastAPI(
     title="Mothr API",
     description="An Mothr API-Endpoint",
@@ -165,6 +316,10 @@ class ChatMessage(BaseModel):
     content: str | List[dict]
 
 class ChatCompletionRequest(BaseModel):
+    # Pass-through: SEMUA field OpenAI-compatible lain (top_p, top_k, seed, stop,
+    # tools, tool_choice, response_format, penalties, reasoning, dll.) diizinkan dan
+    # tidak difilter. Field ekstra tetap diteruskan ke upstream apa adanya.
+    model_config = {"extra": "allow"}
     model: str
     messages: List[ChatMessage]
     temperature: Optional[float] = 1
@@ -172,13 +327,17 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
 
 class OpenAIResponseMessage(BaseModel):
+    model_config = {"extra": "allow"}
     role: str = "assistant"
-    content: str
+    content: Optional[str] = None
+    reasoning: Optional[str] = None
+    reasoning_details: Optional[List[Any]] = None
+    tool_calls: Optional[List[Any]] = None
 
 class OpenAIChoice(BaseModel):
     index: int = 0
     message: OpenAIResponseMessage
-    finish_reason: str = "stop"
+    finish_reason: Optional[str] = "stop"
 
 class OpenAIUsage(BaseModel):
     prompt_tokens: int
@@ -280,6 +439,7 @@ async def update_available_models():
 async def startup_event():
     load_aliases_from_env()
     await update_available_models()
+    await _ensure_catalog()
 
 # --- 3. Agent Prompts ---
 AGENT_PROMPTS = {
@@ -364,7 +524,7 @@ async def run_tasks_with_rate_limit(tasks: List[Any], limit: int, session_logger
     session_logger.info("All rate-limited batches have been processed.")
     return all_results
 
-async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any]):
+async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any], reasoning_config: Optional[dict] = None):
     """Calls the OpenRouter API for a single response using the openai library."""
     session_logger.info(f"--- Calling Agent: {agent_name} (Model: {model_name}, Key: ...{api_key[-4:]}) ---")
     max_retries = 7
@@ -375,9 +535,19 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
     
     messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend([msg.model_dump() for msg in user_messages])
-    
-    payload = {"model": model_name, "messages": messages, **generation_config}
-    session_logger.debug(f"Agent '{agent_name}' Request Payload:\n{json.dumps(payload, indent=2)}")
+
+    # Suntikkan reasoning (effort/max_tokens) + auto-raise max_tokens bila perlu.
+    _apply_reasoning(model_name, reasoning_config, generation_config, session_logger)
+
+    # Semua parameter generasi (termasuk field pass-through seperti top_k/tools/
+    # response_format) dikirim lewat extra_body agar tidak difilter oleh SDK.
+    extra = dict(generation_config)
+    if reasoning_config:
+        extra["reasoning"] = reasoning_config
+    payload: Dict[str, Any] = {"model": model_name, "messages": messages}
+    if extra:
+        payload["extra_body"] = extra
+    session_logger.debug(f"Agent '{agent_name}' Request Payload:\n{json.dumps(payload, indent=2, default=str)}")
 
     for attempt in range(max_retries):
         try:
@@ -388,15 +558,35 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
             if not response.choices:
                 raise APIError("No choices returned from API.")
 
-            response_content = response.choices[0].message.content or ""
+            message = response.choices[0].message
+            choice = response.choices[0]
+            response_content = message.content or ""
+            reasoning_text = getattr(message, "reasoning", None)
+            reasoning_details = getattr(message, "reasoning_details", None)
+            tool_calls = getattr(message, "tool_calls", None)
+            finish_reason = getattr(choice, "finish_reason", None) or "stop"
             usage = response.usage
-            
+            reasoning_tokens = 0
+            if usage is not None:
+                details = getattr(usage, "completion_tokens_details", None)
+                if details is not None:
+                    reasoning_tokens = getattr(details, "reasoning_tokens", 0) or 0
+
+            if reasoning_details:
+                session_logger.info(
+                    f"Agent '{agent_name}' mengembalikan {len(reasoning_details)} blok reasoning_details."
+                )
             session_logger.info(f"Agent '{agent_name}' succeeded on attempt {attempt + 1}")
             return {
                 "agent": agent_name, "status": "success", "response_text": response_content,
+                "reasoning": reasoning_text,
+                "reasoning_details": reasoning_details,
+                "tool_calls": tool_calls,
+                "finish_reason": finish_reason,
                 "prompt_tokens": usage.prompt_tokens if usage else 0,
                 "completion_tokens": usage.completion_tokens if usage else 0,
-                "total_tokens": usage.total_tokens if usage else 0
+                "total_tokens": usage.total_tokens if usage else 0,
+                "reasoning_tokens": reasoning_tokens,
             }
         except json.JSONDecodeError as e:
             last_exception = e
@@ -420,7 +610,7 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
             break
 
     session_logger.error(f"Agent '{agent_name}' failed after {attempt + 1} attempts. Last error: {last_exception}")
-    return {"agent": agent_name, "status": "error", "error": f"Failed after {attempt + 1} retries: {last_exception}", "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return {"agent": agent_name, "status": "error", "error": f"Failed after {attempt + 1} retries: {last_exception}", "response_text": "", "reasoning": None, "reasoning_details": None, "tool_calls": None, "finish_reason": "error", "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0}
 
 async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any]) -> AsyncGenerator[bytes, None]:
     """Calls the OpenRouter API in streaming mode using the openai library and yields SSE-formatted chunks."""
@@ -431,12 +621,19 @@ async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_nam
     messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend([msg.model_dump() for msg in user_messages])
 
-    payload = {"model": model_name, "messages": messages, "stream": True, **generation_config}
-    session_logger.debug(f"Agent '{agent_name}' Stream Request Payload:\n{json.dumps(payload, indent=2)}")
+    payload: Dict[str, Any] = {"model": model_name, "messages": messages, "stream": True}
+    extra = dict(generation_config)
+    if extra:
+        payload["extra_body"] = extra
+    session_logger.debug(f"Agent '{agent_name}' Stream Request Payload:\n{json.dumps(payload, indent=2, default=str)}")
 
     try:
         stream = await client.chat.completions.create(**payload)
         async for chunk in stream:
+            if chunk.choices:
+                delta = chunk.choices[0].delta
+                if getattr(delta, "reasoning_details", None):
+                    session_logger.debug(f"Agent '{agent_name}' reasoning_details chunk diteruskan.")
             yield f"data: {chunk.model_dump_json()}\n\n".encode('utf-8')
         yield b"data: [DONE]\n\n"
     except Exception as e:
@@ -563,6 +760,26 @@ def extract_user_question(chat_request: ChatCompletionRequest) -> str:
     return user_question
 
 
+# Field kontrol yang BUKAN parameter generasi dan tidak boleh diteruskan apa adanya.
+_NON_GENERATION_FIELDS = {"model", "messages", "stream"}
+
+
+def build_generation_config(body: dict) -> Dict[str, Any]:
+    """Meneruskan SEMUA parameter generasi dari body asli (pass-through).
+
+    Selain temperature/max_tokens, semua field OpenAI-compatible lain
+    (top_p, top_k, seed, stop, tools, tool_choice, response_format, penalties,
+    reasoning, dll.) diteruskan verbatim ke upstream. Hanya `model`, `messages`,
+    dan `stream` yang dikecualikan karena ditangani terpisah.
+    """
+    config: Dict[str, Any] = {}
+    for key, value in body.items():
+        if key in _NON_GENERATION_FIELDS:
+            continue
+        config[key] = value
+    return config
+
+
 def _sse_progress_chunk(text: str, model: str) -> bytes:
     """Chunk SSE role-less dengan teks progress (keep-alive), sesuai SSE spec."""
     return f'data: {{"id":"chatcmpl-progress","object":"chat.completion.chunk","created":{int(time.time())},"model":"{model}","choices":[{{"index":0,"delta":{{"role":"assistant","content":{json.dumps(text)}}},"finish_reason":null}}]}}\n\n'.encode("utf-8")
@@ -574,6 +791,7 @@ async def handle_hijarki(
     requested_model: str,
     session_id: str,
     session_logger: logging.Logger,
+    body: Optional[dict] = None,
 ):
     """Menjalankan workflow Hijarki (config-driven multi-agent).
 
@@ -594,8 +812,9 @@ async def handle_hijarki(
 
     session_logger.info(f"--- Hijarki workflow: profil '{profile_name}' (sub-agents: {len(profile.get('sub_agents', []))}) ---")
 
-    generation_config = {"temperature": chat_request.temperature}
-    if chat_request.max_tokens:
+    generation_config = build_generation_config(body or {})
+    generation_config.setdefault("temperature", chat_request.temperature)
+    if chat_request.max_tokens and "max_tokens" not in generation_config:
         generation_config["max_tokens"] = chat_request.max_tokens
 
     user_question = extract_user_question(chat_request)
@@ -611,12 +830,12 @@ async def handle_hijarki(
     except OSError:
         notes_path = None
 
-    async def hijarki_caller(*, agent_name, model_name, system_prompt, messages, generation_config):
+    async def hijarki_caller(*, agent_name, model_name, system_prompt, messages, generation_config, reasoning_config=None):
         # Engine mengirim list[dict]; call_openrouter_agent menerima List[ChatMessage].
         chat_msgs = [ChatMessage(**m) if isinstance(m, dict) else m for m in messages]
         return await call_openrouter_agent(
             session_logger, agent_name, next(api_key_rotator), model_name,
-            system_prompt, chat_msgs, generation_config,
+            system_prompt, chat_msgs, generation_config, reasoning_config,
         )
 
     async def _run_pipeline() -> "HijarkiResult":
@@ -656,7 +875,15 @@ async def handle_hijarki(
                 yield _sse_progress_chunk("Praxis masih berpikir...", requested_model)
             session_logger.info(f"--- Hijarki selesai: buffer size {len(result.buffer)} ---")
             # Respon final setelah Buffer Zone tuntas + [DONE]
-            yield f'data: {{"id":"chatcmpl-{uuid.uuid4().hex}","object":"chat.completion.chunk","created":{int(time.time())},"model":"{requested_model}","choices":[{{"index":0,"delta":{{"role":"assistant","content":{json.dumps(result.final_content)}}},"finish_reason":"stop"}}]}}\n\n'.encode("utf-8")
+            final_delta = {"role": "assistant", "content": result.final_content}
+            if getattr(result, "master_reasoning", None):
+                final_delta["reasoning"] = result.master_reasoning
+            if getattr(result, "master_reasoning_details", None):
+                final_delta["reasoning_details"] = result.master_reasoning_details
+            if getattr(result, "master_tool_calls", None):
+                final_delta["tool_calls"] = result.master_tool_calls
+            final_finish = getattr(result, "master_finish_reason", None) or "stop"
+            yield f'data: {{"id":"chatcmpl-{uuid.uuid4().hex}","object":"chat.completion.chunk","created":{int(time.time())},"model":"{requested_model}","choices":[{{"index":0,"delta":{json.dumps(final_delta, default=str)},"finish_reason":{json.dumps(final_finish)}}}]}}\n\n'.encode("utf-8")
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(hijarki_stream_generator(), media_type="text/event-stream")
@@ -666,8 +893,13 @@ async def handle_hijarki(
     session_logger.info(f"--- Hijarki selesai: buffer size {len(result.buffer)} ---")
     session_logger.info(f"Empty Master? {not result.final_content.strip()}")
 
-    response_message = OpenAIResponseMessage(content=result.final_content)
-    choice = OpenAIChoice(message=response_message, finish_reason="stop")
+    response_message = OpenAIResponseMessage(
+        content=result.final_content,
+        reasoning=getattr(result, "master_reasoning", None),
+        reasoning_details=getattr(result, "master_reasoning_details", None),
+        tool_calls=getattr(result, "master_tool_calls", None),
+    )
+    choice = OpenAIChoice(message=response_message, finish_reason=getattr(result, "master_finish_reason", None) or "stop")
     usage = OpenAIUsage(
         prompt_tokens=result.prompt_tokens,
         completion_tokens=result.completion_tokens,
@@ -718,6 +950,7 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
             requested_model=requested_model,
             session_id=session_id,
             session_logger=session_logger,
+            body=body,
         )
 
     # 2. Validate against the ground truth: the ROUTER_MODEL_PALETTE from .env
@@ -731,8 +964,9 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
     chat_request.model = model_to_validate_and_call
     # ---
 
-    generation_config = {"temperature": chat_request.temperature}
-    if chat_request.max_tokens:
+    generation_config = build_generation_config(body)
+    generation_config.setdefault("temperature", chat_request.temperature)
+    if chat_request.max_tokens and "max_tokens" not in generation_config:
         generation_config["max_tokens"] = chat_request.max_tokens
 
     # Ekstrak teks user terakhir untuk konteks/pemicu prompt. File/attachment TIDAK
@@ -775,20 +1009,9 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                     async for chunk in stream:
                         yield chunk
                 else:
-                    system_prompt_parts = []
-                    user_messages = []
-                    for msg in chat_request.messages:
-                        if msg.role == "system":
-                            if isinstance(msg.content, str):
-                                system_prompt_parts.append(msg.content)
-                            elif isinstance(msg.content, list):
-                                for part in msg.content:
-                                    if hasattr(part, 'text'):
-                                        system_prompt_parts.append(part.text)
-                        else:
-                            user_messages.append(msg)
-                    system_prompt = "".join(system_prompt_parts)
-                    stream = call_openrouter_agent_stream(session_logger, f"streaming_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
+                    # Pass-through verbatim: SEMUA pesan (termasuk system, image,
+                    # audio, file) diteruskan apa adanya tanpa digabung/difilter.
+                    stream = call_openrouter_agent_stream(session_logger, f"streaming_{chat_request.model}", next(api_key_rotator), chat_request.model, "", chat_request.messages, generation_config)
                     async for chunk in stream:
                         yield chunk
 
@@ -801,6 +1024,10 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
         session_logger.info("Non-streaming response requested.")
         
         model_config = None
+        final_reasoning = None
+        final_reasoning_details = None
+        final_tool_calls = None
+        final_finish_reason = "stop"
         if chat_request.model == "ra-1":
             model_config = await get_agent_model_config(session_logger, user_question)
         elif chat_request.model == "ra-1-pro":
@@ -837,31 +1064,27 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                 raise HTTPException(status_code=500, detail=f"Master synthesizer failed: {synthesizer_result['error']}")
 
             final_content = synthesizer_result["response_text"]
+            final_reasoning = synthesizer_result.get("reasoning")
+            final_reasoning_details = synthesizer_result.get("reasoning_details")
+            final_tool_calls = synthesizer_result.get("tool_calls")
+            final_finish_reason = synthesizer_result.get("finish_reason", "stop")
             total_prompt_tokens = sum(res.get("prompt_tokens", 0) for res in agent_results) + synthesizer_result.get("prompt_tokens", 0)
             total_completion_tokens = sum(res.get("completion_tokens", 0) for res in agent_results) + synthesizer_result.get("completion_tokens", 0)
 
         else: # Passthrough for other models
             session_logger.info(f"Executing direct passthrough for model '{chat_request.model}'.")
-            system_prompt_parts = []
-            user_messages = []
-            for msg in chat_request.messages:
-                if msg.role == "system":
-                    if isinstance(msg.content, str):
-                        system_prompt_parts.append(msg.content)
-                    elif isinstance(msg.content, list):
-                        for part in msg.content:
-                            if hasattr(part, 'text'):
-                                system_prompt_parts.append(part.text)
-                else:
-                    user_messages.append(msg)
-            system_prompt = "".join(system_prompt_parts)
-            
-            direct_result = await call_openrouter_agent(session_logger, f"direct_passthrough_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
+            # Pass-through verbatim: SEMUA pesan (system, image, audio, file)
+            # diteruskan apa adanya tanpa digabung/difilter.
+            direct_result = await call_openrouter_agent(session_logger, f"direct_passthrough_{chat_request.model}", next(api_key_rotator), chat_request.model, "", chat_request.messages, generation_config)
 
             if direct_result["status"] == "error":
                 raise HTTPException(status_code=500, detail=f"Direct model call failed: {direct_result['error']}")
             
             final_content = direct_result["response_text"]
+            final_reasoning = direct_result.get("reasoning")
+            final_reasoning_details = direct_result.get("reasoning_details")
+            final_tool_calls = direct_result.get("tool_calls")
+            final_finish_reason = direct_result.get("finish_reason", "stop")
             total_prompt_tokens = direct_result.get("prompt_tokens", 0)
             total_completion_tokens = direct_result.get("completion_tokens", 0)
 
@@ -869,8 +1092,13 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
         session_logger.debug(f"Final Output:\n{final_content}")
         session_logger.info(f"--- END SESSION: {session_id} ---")
 
-        response_message = OpenAIResponseMessage(content=final_content)
-        choice = OpenAIChoice(message=response_message, finish_reason="stop")
+        response_message = OpenAIResponseMessage(
+            content=final_content,
+            reasoning=final_reasoning,
+            reasoning_details=final_reasoning_details,
+            tool_calls=final_tool_calls,
+        )
+        choice = OpenAIChoice(message=response_message, finish_reason=final_finish_reason)
         usage = OpenAIUsage(prompt_tokens=total_prompt_tokens, completion_tokens=total_completion_tokens, total_tokens=total_prompt_tokens + total_completion_tokens)
 
         return ChatCompletionResponse(model=chat_request.model, choices=[choice], usage=usage)

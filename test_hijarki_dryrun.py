@@ -57,9 +57,15 @@ class FakeCaller:
             "agent": name,
             "status": "success",
             "response_text": response_text,
+            "reasoning": f"THINK_{name}",
+            "reasoning_details": [
+                {"type": "reasoning.text", "text": f"step1_{name}", "index": 0},
+                {"type": "reasoning.text", "text": f"step2_{name}", "index": 1},
+            ],
             "prompt_tokens": 10,
             "completion_tokens": 20,
             "total_tokens": 30,
+            "reasoning_tokens": 5,
         }
 
 
@@ -161,6 +167,24 @@ async def main() -> None:
 
     # (i) Profil "master saja" (tanpa sub_agents) valid, terdeteksi, dan berjalan
     await _test_master_only_profile()
+
+    # (j) reasoning_config diteruskan ke caller + reasoning_details di-relay native (urutan persis)
+    for call in caller.calls:
+        assert "reasoning_config" in call, call.keys()
+    # sa_2 melihat 1 konteks assistant (dari sa_1) yang membawa reasoning_details sa_1
+    ctx_msg = [m for m in caller.calls[1]["messages"] if m["role"] == "assistant"]
+    assert len(ctx_msg) == 1
+    details = ctx_msg[0].get("reasoning_details")
+    assert details is not None, ctx_msg[0]
+    assert [d["index"] for d in details] == [0, 1], details
+    assert details[0]["text"] == "step1_sa_1", details
+    # master melihat konteks dari staf_1 juga membawa reasoning_details
+    master_ctx = [m for m in caller.calls[7]["messages"] if m["role"] == "assistant"]
+    assert any(m.get("reasoning_details") for m in master_ctx)
+    # master_reasoning_details terekspos di hasil
+    assert result.master_reasoning == "THINK_master"
+    assert result.master_reasoning_details and result.master_reasoning_details[0]["index"] == 0
+    print("(j) relay reasoning native + ekspos hasil ok")
 
     shutil.rmtree(tmpdir, ignore_errors=True)
     print("\nSEMUA PENGUJIAN LULUS ✔")

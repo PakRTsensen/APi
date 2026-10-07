@@ -31,5 +31,8 @@
     "name": "staf_2",
     "system_prompt": "",
     "model": null
+  },
+  "default_reasoning": {
+    "effort": "max"
   }
 }

@@ -102,6 +102,35 @@ try:
 except json.JSONDecodeError:
     raise ValueError("ROUTER_MODEL_PALETTE in .env file is not a valid JSON string.")
 
+# Reasoning (legacy): deteksi Claude sederhana (tanpa katalog) + default max_tokens aman.
+try:
+    _REASONING_MAX_TOKENS = int(os.getenv("HIJARKI_REASONING_MAX_TOKENS", "32000"))
+except ValueError:
+    _REASONING_MAX_TOKENS = 32000
+_CLAUDE_MODELS_OVERRIDE = {
+    m.strip().lower() for m in os.getenv("CLAUDE_MODELS", "").split(",") if m.strip()
+}
+_OFFLINE_CLAUDE_HINTS = ("anthropic/", "claude", "fable", "opus", "sonnet", "haiku")
+
+
+def _is_claude_model(model_name: str) -> bool:
+    if not isinstance(model_name, str):
+        return False
+    slug = model_name.strip().lower()
+    if slug in _CLAUDE_MODELS_OVERRIDE:
+        return True
+    return any(hint in slug for hint in _OFFLINE_CLAUDE_HINTS)
+
+
+# Field kontrol yang BUKAN parameter generasi dan tidak diteruskan apa adanya.
+_NON_GENERATION_FIELDS = {"model", "messages", "stream"}
+
+
+def build_generation_config(body: dict) -> Dict[str, Any]:
+    """Pass-through SEMUA parameter generasi dari body asli (selain model/messages/stream)."""
+    return {k: v for k, v in body.items() if k not in _NON_GENERATION_FIELDS}
+
+
 app = FastAPI(
     title="Mothr API",
     description="An Mothr API-Endpoint",
@@ -155,6 +184,7 @@ class ChatMessage(BaseModel):
     content: str | List[TextContentPart | ImageContentPart]
 
 class ChatCompletionRequest(BaseModel):
+    model_config = {"extra": "allow"}
     model: str
     messages: List[ChatMessage]
     temperature: Optional[float] = 1
@@ -162,13 +192,17 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
 
 class OpenAIResponseMessage(BaseModel):
+    model_config = {"extra": "allow"}
     role: str = "assistant"
-    content: str
+    content: Optional[str] = None
+    reasoning: Optional[str] = None
+    reasoning_details: Optional[List[Any]] = None
+    tool_calls: Optional[List[Any]] = None
 
 class OpenAIChoice(BaseModel):
     index: int = 0
     message: OpenAIResponseMessage
-    finish_reason: str = "stop"
+    finish_reason: Optional[str] = "stop"
 
 class OpenAIUsage(BaseModel):
     prompt_tokens: int
@@ -346,7 +380,7 @@ async def run_tasks_with_rate_limit(tasks: List[Any], limit: int, session_logger
     session_logger.info("All rate-limited batches have been processed.")
     return all_results
 
-async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any]):
+async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any], reasoning_config: Optional[dict] = None):
     """Calls the OpenRouter API for a single response using the openai library."""
     session_logger.info(f"--- Calling Agent: {agent_name} (Model: {model_name}, Key: ...{api_key[-4:]}) ---")
     max_retries = 7
@@ -357,9 +391,24 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
     
     messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend([msg.model_dump() for msg in user_messages])
-    
-    payload = {"model": model_name, "messages": messages, **generation_config}
-    session_logger.debug(f"Agent '{agent_name}' Request Payload:\n{json.dumps(payload, indent=2)}")
+
+    # Reasoning (Claude/Fable/Opus): suntik effort + jaga max_tokens > budget 95%.
+    if reasoning_config and _is_claude_model(model_name):
+        effort = reasoning_config.get("effort")
+        effort = effort.strip().lower() if isinstance(effort, str) else None
+        if effort in ("max", "xhigh"):
+            budget = reasoning_config.get("max_tokens") or min(int(_REASONING_MAX_TOKENS * 0.95), 128000)
+            mt = generation_config.get("max_tokens")
+            if not isinstance(mt, int) or mt <= budget:
+                generation_config["max_tokens"] = max(int(budget) + 4096, _REASONING_MAX_TOKENS)
+
+    payload: Dict[str, Any] = {"model": model_name, "messages": messages}
+    extra = dict(generation_config)
+    if reasoning_config and _is_claude_model(model_name):
+        extra["reasoning"] = reasoning_config
+    if extra:
+        payload["extra_body"] = extra
+    session_logger.debug(f"Agent '{agent_name}' Request Payload:\n{json.dumps(payload, indent=2, default=str)}")
 
     for attempt in range(max_retries):
         try:
@@ -370,12 +419,18 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
             if not response.choices:
                 raise APIError("No choices returned from API.")
 
-            response_content = response.choices[0].message.content or ""
+            message = response.choices[0].message
+            choice = response.choices[0]
+            response_content = message.content or ""
             usage = response.usage
             
             session_logger.info(f"Agent '{agent_name}' succeeded on attempt {attempt + 1}")
             return {
                 "agent": agent_name, "status": "success", "response_text": response_content,
+                "reasoning": getattr(message, "reasoning", None),
+                "reasoning_details": getattr(message, "reasoning_details", None),
+                "tool_calls": getattr(message, "tool_calls", None),
+                "finish_reason": getattr(choice, "finish_reason", None) or "stop",
                 "prompt_tokens": usage.prompt_tokens if usage else 0,
                 "completion_tokens": usage.completion_tokens if usage else 0,
                 "total_tokens": usage.total_tokens if usage else 0
@@ -402,7 +457,7 @@ async def call_openrouter_agent(session_logger: logging.Logger, agent_name: str,
             break
 
     session_logger.error(f"Agent '{agent_name}' failed after {attempt + 1} attempts. Last error: {last_exception}")
-    return {"agent": agent_name, "status": "error", "error": f"Failed after {attempt + 1} retries: {last_exception}", "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return {"agent": agent_name, "status": "error", "error": f"Failed after {attempt + 1} retries: {last_exception}", "response_text": "", "reasoning": None, "reasoning_details": None, "tool_calls": None, "finish_reason": "error", "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_name: str, api_key: str, model_name: str, system_prompt: str, user_messages: List[ChatMessage], generation_config: Dict[str, Any]) -> AsyncGenerator[bytes, None]:
     """Calls the OpenRouter API in streaming mode using the openai library and yields SSE-formatted chunks."""
@@ -413,8 +468,11 @@ async def call_openrouter_agent_stream(session_logger: logging.Logger, agent_nam
     messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend([msg.model_dump() for msg in user_messages])
 
-    payload = {"model": model_name, "messages": messages, "stream": True, **generation_config}
-    session_logger.debug(f"Agent '{agent_name}' Stream Request Payload:\n{json.dumps(payload, indent=2)}")
+    payload: Dict[str, Any] = {"model": model_name, "messages": messages, "stream": True}
+    extra = dict(generation_config)
+    if extra:
+        payload["extra_body"] = extra
+    session_logger.debug(f"Agent '{agent_name}' Stream Request Payload:\n{json.dumps(payload, indent=2, default=str)}")
 
     try:
         stream = await client.chat.completions.create(**payload)
@@ -560,8 +618,9 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
     chat_request.model = model_to_validate_and_call
     # ---
 
-    generation_config = {"temperature": chat_request.temperature}
-    if chat_request.max_tokens:
+    generation_config = build_generation_config(body)
+    generation_config.setdefault("temperature", chat_request.temperature)
+    if chat_request.max_tokens and "max_tokens" not in generation_config:
         generation_config["max_tokens"] = chat_request.max_tokens
 
     user_question = ""
@@ -614,20 +673,8 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                     async for chunk in stream:
                         yield chunk
                 else:
-                    system_prompt_parts = []
-                    user_messages = []
-                    for msg in chat_request.messages:
-                        if msg.role == "system":
-                            if isinstance(msg.content, str):
-                                system_prompt_parts.append(msg.content)
-                            elif isinstance(msg.content, list):
-                                for part in msg.content:
-                                    if hasattr(part, 'text'):
-                                        system_prompt_parts.append(part.text)
-                        else:
-                            user_messages.append(msg)
-                    system_prompt = "".join(system_prompt_parts)
-                    stream = call_openrouter_agent_stream(session_logger, f"streaming_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
+                    # Pass-through verbatim: semua pesan diteruskan apa adanya.
+                    stream = call_openrouter_agent_stream(session_logger, f"streaming_{chat_request.model}", next(api_key_rotator), chat_request.model, "", chat_request.messages, generation_config)
                     async for chunk in stream:
                         yield chunk
 
@@ -640,6 +687,10 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
         session_logger.info("Non-streaming response requested.")
         
         model_config = None
+        final_reasoning = None
+        final_reasoning_details = None
+        final_tool_calls = None
+        final_finish_reason = "stop"
         if chat_request.model == "ra-1":
             model_config = await get_agent_model_config(session_logger, user_question)
         elif chat_request.model == "ra-1-pro":
@@ -676,31 +727,26 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
                 raise HTTPException(status_code=500, detail=f"Master synthesizer failed: {synthesizer_result['error']}")
 
             final_content = synthesizer_result["response_text"]
+            final_reasoning = synthesizer_result.get("reasoning")
+            final_reasoning_details = synthesizer_result.get("reasoning_details")
+            final_tool_calls = synthesizer_result.get("tool_calls")
+            final_finish_reason = synthesizer_result.get("finish_reason", "stop")
             total_prompt_tokens = sum(res.get("prompt_tokens", 0) for res in agent_results) + synthesizer_result.get("prompt_tokens", 0)
             total_completion_tokens = sum(res.get("completion_tokens", 0) for res in agent_results) + synthesizer_result.get("completion_tokens", 0)
 
         else: # Passthrough for other models
             session_logger.info(f"Executing direct passthrough for model '{chat_request.model}'.")
-            system_prompt_parts = []
-            user_messages = []
-            for msg in chat_request.messages:
-                if msg.role == "system":
-                    if isinstance(msg.content, str):
-                        system_prompt_parts.append(msg.content)
-                    elif isinstance(msg.content, list):
-                        for part in msg.content:
-                            if hasattr(part, 'text'):
-                                system_prompt_parts.append(part.text)
-                else:
-                    user_messages.append(msg)
-            system_prompt = "".join(system_prompt_parts)
-            
-            direct_result = await call_openrouter_agent(session_logger, f"direct_passthrough_{chat_request.model}", next(api_key_rotator), chat_request.model, system_prompt, user_messages, generation_config)
+            # Pass-through verbatim: semua pesan (system, image, audio, file).
+            direct_result = await call_openrouter_agent(session_logger, f"direct_passthrough_{chat_request.model}", next(api_key_rotator), chat_request.model, "", chat_request.messages, generation_config)
 
             if direct_result["status"] == "error":
                 raise HTTPException(status_code=500, detail=f"Direct model call failed: {direct_result['error']}")
             
             final_content = direct_result["response_text"]
+            final_reasoning = direct_result.get("reasoning")
+            final_reasoning_details = direct_result.get("reasoning_details")
+            final_tool_calls = direct_result.get("tool_calls")
+            final_finish_reason = direct_result.get("finish_reason", "stop")
             total_prompt_tokens = direct_result.get("prompt_tokens", 0)
             total_completion_tokens = direct_result.get("completion_tokens", 0)
 
@@ -708,8 +754,13 @@ async def chat_completions(request: Request, authenticated_proxy_key: str = Secu
         session_logger.debug(f"Final Output:\n{final_content}")
         session_logger.info(f"--- END SESSION: {session_id} ---")
 
-        response_message = OpenAIResponseMessage(content=final_content)
-        choice = OpenAIChoice(message=response_message, finish_reason="stop")
+        response_message = OpenAIResponseMessage(
+            content=final_content,
+            reasoning=final_reasoning,
+            reasoning_details=final_reasoning_details,
+            tool_calls=final_tool_calls,
+        )
+        choice = OpenAIChoice(message=response_message, finish_reason=final_finish_reason)
         usage = OpenAIUsage(prompt_tokens=total_prompt_tokens, completion_tokens=total_completion_tokens, total_tokens=total_prompt_tokens + total_completion_tokens)
 
         return ChatCompletionResponse(model=chat_request.model, choices=[choice], usage=usage)
