@@ -5,6 +5,7 @@
   "models": {
     "_comment": "Map opsional nama-agent -> model. Prioritas: field 'model' di agent > models[nama] > default_model > fallback server."
   },
+  "_comment_reasoning": "KONFIG THINKING TRACE (OpenRouter). 'default_reasoning' berlaku ke SEMUA agent; 'reasoning' = map nama-agent -> config (override default). Field 'reasoning' di tiap agent menang atas keduanya. Config: string \"max\" ATAU objek {\"effort\":\"max|xhigh|high|medium|low|minimal|none\", \"max_tokens\":N, \"enabled\":bool, \"exclude\":bool}. Prioritas: agent.reasoning > reasoning[nama] > default_reasoning > env HIJARKI_REASONING_EFFORT. CATATAN: hanya diterapkan pada model Claude/Fable/Opus-class (deteksi katalog/env CLAUDE_MODELS). Preserve reasoning_details (relay antar-agent) SELALU aktif bila model mengembalikannya.",
   "sub_agents": [
     {
       "name": "pemeta",
